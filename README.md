@@ -27,10 +27,10 @@ vcpkg install
 ### 3. Configure o CMake
 
 ````
-cmake -B build -S . ^
--DCMAKE_TOOLCHAIN_FILE="C:/.../vcpkg.cmake" ^
--DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --preset windows-debug
 ````
+
+Caso necessario alterar o caminho de ``/.../vcpkg.cmake`` em ``CMakePresets.json``
 
 ### 4. Compile
 
