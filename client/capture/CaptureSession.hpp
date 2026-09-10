@@ -20,12 +20,13 @@ private:
     ComPtr<ID3D11Resource> id3d11Resource{};
     ComPtr<ID3D11Texture2D> id3d11Texture2D{};
     std::unique_ptr<TexturePool> texturePool{};
+    std::shared_ptr<Frame> lastFrame = nullptr;
 
 public:
     HRESULT Initialize(const HMONITOR &monitor);
     HRESULT DuplicateOutput();
-    std::unique_ptr<Frame> CaptureFrame();
-    HRESULT CaptureScreen(const HMONITOR &monitor);
+    HRESULT CaptureFrame(std::shared_ptr<Frame> &outFrame);
+    HRESULT CaptureScreen(const HMONITOR &monitor, const double frameRate);
 };
 
 

@@ -1,5 +1,6 @@
 #include "CaptureSession.hpp"
 #include <spdlog/spdlog.h>
+#include <thread>
 
 #include <chrono>
 
@@ -62,24 +63,34 @@ HRESULT CaptureSession::DuplicateOutput() {
     return S_OK;
 }
 
-std::unique_ptr<Frame> CaptureSession::CaptureFrame() {
+HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
 
     // Capture a frame and query as a Texture2d
     while (true) {
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
         ComPtr<IDXGIResource> dxgiResource{};
 
-        HRESULT hr = dxgiOutputDuplication->AcquireNextFrame(2000, &frameInfo, dxgiResource.GetAddressOf());
+        HRESULT hr = dxgiOutputDuplication->AcquireNextFrame(1, &frameInfo, dxgiResource.GetAddressOf());
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            if (lastFrame != nullptr) {
+                outFrame = lastFrame;
+                return S_OK;
+            }
+            
             continue;
         }
 
         if (FAILED(hr)) {
             spdlog::error("Failed to AcquireNextFrame. HRESULT: {}", hr);
-            return {};
+            return hr;
         }
 
         if (frameInfo.LastPresentTime.QuadPart == 0) {
+            if (lastFrame != nullptr) {
+                dxgiOutputDuplication->ReleaseFrame();
+                outFrame = lastFrame;
+                return S_OK;
+            }
             // Checks if the captured frame is empty, if so, releases it and capture another
             dxgiOutputDuplication->ReleaseFrame();
             continue;
@@ -90,7 +101,7 @@ std::unique_ptr<Frame> CaptureSession::CaptureFrame() {
             dxgiOutputDuplication->ReleaseFrame();
 
             spdlog::error("Failed to query ID3D11Texture2D");
-            return {};
+            return hr;
         }
 
         // initialize texturePool if it hasn't already happened
@@ -113,13 +124,17 @@ std::unique_ptr<Frame> CaptureSession::CaptureFrame() {
 
         dxgiOutputDuplication->ReleaseFrame();
 
-        std::unique_ptr<Frame> frame = std::make_unique<Frame>(frameInfo, texture, texturePool.get(), textureIndex);
+        std::shared_ptr<Frame> frame = std::make_unique<Frame>(frameInfo, texture, texturePool.get(), textureIndex);
 
-        return frame;
+        lastFrame = frame;
+
+        outFrame = frame;
+
+        return S_OK;
     }
 }
 
-HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor) {
+HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double frameRate) {
     // Class workflow
     HRESULT hr{};
 
@@ -134,13 +149,25 @@ HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor) {
     auto inicio = std::chrono::steady_clock::now();
     int fpsCount = 0;
 
+    std::chrono::duration<double> time_per_frame(1.0 / frameRate);
+
+    auto nextDeadline = std::chrono::steady_clock::now();
+
     bool sharing = true;
     while (sharing) {
-        auto frame = CaptureFrame();
+        nextDeadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(time_per_frame);
+
+        std::shared_ptr<Frame> frame;
+        CaptureFrame(frame);
+
         if (!frame) {
             spdlog::error("Failed to capture frame");
         }
-        fpsCount += 1;
+        fpsCount++;
+
+        
+
+        std::this_thread::sleep_until(nextDeadline);
 
         auto duracao = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - inicio);
         if (duracao >= std::chrono::seconds(1)) {

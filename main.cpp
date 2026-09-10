@@ -29,7 +29,7 @@ int main() {
     std::cin >> input;
 
     CaptureSession captureSession{};
-    HRESULT hr = captureSession.CaptureScreen(hmonitors[input]);
+    HRESULT hr = captureSession.CaptureScreen(hmonitors[input], 30.0);
     std::cout << hr << std::endl;
 
     return 0;
