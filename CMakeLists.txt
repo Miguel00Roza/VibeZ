@@ -3,7 +3,6 @@ project(VibeZ)
 
 set(CMAKE_CXX_STANDARD 20)
 
-find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Stb REQUIRED)
 
@@ -20,7 +19,6 @@ add_executable(VibeZ main.cpp
 target_include_directories(VibeZ PRIVATE ${Stb_INCLUDE_DIR})
 
 target_link_libraries(VibeZ PRIVATE
-        fmt::fmt
         spdlog::spdlog
         dxgi.lib
         d3d11.lib
