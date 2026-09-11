@@ -4,6 +4,7 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <memory>
+#include <atomic>
 
 #include "Frame.hpp"
 #include "TexturePool.hpp"
@@ -12,6 +13,7 @@ using Microsoft::WRL::ComPtr;
 
 class CaptureSession {
 private:
+    HMONITOR monitor{};
     ComPtr<IDXGIAdapter1> dxgiAdapter{};
     ComPtr<IDXGIOutput> dxgiOutput{};
     ComPtr<ID3D11Device> id3d11Device{};
@@ -24,9 +26,10 @@ private:
 
 public:
     HRESULT Initialize(const HMONITOR &monitor);
+    HRESULT ConsultMonitor();
     HRESULT DuplicateOutput();
     HRESULT CaptureFrame(std::shared_ptr<Frame> &outFrame);
-    HRESULT CaptureScreen(const HMONITOR &monitor, const double frameRate);
+    HRESULT CaptureScreen(const HMONITOR &monitor, const double frameRate, const std::atomic<bool> *sharing);
 };
 
 

@@ -1,6 +1,9 @@
 #include "CaptureSession.hpp"
 #include <spdlog/spdlog.h>
 #include <thread>
+#include <atomic>
+#include <windows.h>
+#include <iostream>
 
 #include <chrono>
 
@@ -31,13 +34,14 @@ HRESULT CaptureSession::Initialize(const HMONITOR &monitor) {
         ++i;
     }
 
+    spdlog::error("Failed to found monitor or monitor disconnected");
     return E_FAIL;
 }
 
 HRESULT CaptureSession::DuplicateOutput() {
 
     // Create a D3D11Device and save
-    HRESULT hr = D3D11CreateDevice(dxgiAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, id3d11Device.GetAddressOf(), nullptr, id3d11DeviceContext.GetAddressOf());
+    HRESULT hr = D3D11CreateDevice(dxgiAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, id3d11Device.ReleaseAndGetAddressOf(), nullptr, id3d11DeviceContext.ReleaseAndGetAddressOf());
     if (FAILED(hr)) {
         spdlog::error("Failed to create D3D11 device");
         return hr;
@@ -54,9 +58,10 @@ HRESULT CaptureSession::DuplicateOutput() {
 
 
     // Duplicate DXGIOutput1 and save
-    hr = dxgiOutput1->DuplicateOutput(id3d11Device.Get(), dxgiOutputDuplication.GetAddressOf());
+    hr = dxgiOutput1->DuplicateOutput(id3d11Device.Get(), dxgiOutputDuplication.ReleaseAndGetAddressOf());
+ 
     if (FAILED(hr)) {
-        spdlog::error("Failed to duplicate IDXGIOutput1");
+        spdlog::error("Failed to duplicate IDXGIOutput1, HRESULT: {}", hr);
         return hr;
     }
 
@@ -77,6 +82,23 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
                 return S_OK;
             }
             
+            continue;
+        }
+
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            Sleep(2000);
+            // TODO: futuramente substituir esse sleep por algo mais correto, isso funciona meio que na gambiarra
+            // TODO: recriar texturePool apos mudança de resolução
+
+            hr = Initialize(monitor);
+            if (FAILED(hr)) {
+                return hr;
+            }
+
+            hr = DuplicateOutput();
+            if (FAILED(hr))
+                return hr;
+             
             continue;
         }
 
@@ -134,7 +156,9 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
     }
 }
 
-HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double frameRate) {
+HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double frameRate, const std::atomic<bool> *sharing) {
+    this->monitor = monitor;
+
     // Class workflow
     HRESULT hr{};
 
@@ -153,12 +177,15 @@ HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double fram
 
     auto nextDeadline = std::chrono::steady_clock::now();
 
-    bool sharing = true;
-    while (sharing) {
+    while (sharing->load()) {
         nextDeadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(time_per_frame);
 
         std::shared_ptr<Frame> frame;
-        CaptureFrame(frame);
+        hr = CaptureFrame(frame);
+
+        if (FAILED(hr)) {
+            return hr;
+        }
 
         if (!frame) {
             spdlog::error("Failed to capture frame");
