@@ -1,11 +1,14 @@
 #include "CaptureSession.hpp"
+#include "FrameQueue.hpp"
 #include <spdlog/spdlog.h>
 #include <thread>
 #include <atomic>
 #include <windows.h>
 #include <iostream>
-
+#include <queue>
 #include <chrono>
+#include <condition_variable>
+
 
 HRESULT CaptureSession::Initialize(const HMONITOR &monitor) {
 
@@ -87,7 +90,7 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
 
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             Sleep(2000);
-            // TODO: futuramente substituir esse sleep por algo mais correto, isso funciona meio que na gambiarra
+            // futuramente substituir esse sleep por algo mais correto, isso funciona meio que na gambiarra
             // TODO: recriar texturePool apos mudança de resolução
 
             hr = Initialize(monitor);
@@ -98,6 +101,11 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
             hr = DuplicateOutput();
             if (FAILED(hr))
                 return hr;
+
+            if (texturePool) {
+                lastFrame.reset();
+                texturePool.reset();
+            }
              
             continue;
         }
@@ -156,6 +164,86 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
     }
 }
 
+
+// Producer frame and Consumer frame
+
+
+std::mutex mtx;
+std::condition_variable cv;
+
+void useFrame(FrameQueue* fq, const std::atomic<bool>* sharing) {
+
+    while (sharing->load()) {
+        std::unique_lock<std::mutex> lock(mtx);
+
+        cv.wait(lock, [&] { return (!fq->empty()) || (!sharing->load()); });
+
+        std::shared_ptr<Frame> frame = fq->get_front_and_update();
+        if (frame) {
+            std::cout << "Usou o frame" << std::endl;
+        }
+
+        lock.unlock();
+
+        // SIMULA USAR O FRAME OU SLA
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+}
+
+void producerFrames(const std::atomic<bool>* sharing, const double frameRate, CaptureSession* captureSession, FrameQueue* frameQueue) {
+
+    auto inicio = std::chrono::steady_clock::now();
+    int fpsCount = 0;
+
+    std::chrono::duration<double> time_per_frame(1.0 / frameRate);
+
+    auto nextDeadline = std::chrono::steady_clock::now();
+
+    while (sharing->load()) {
+
+
+        nextDeadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(time_per_frame);
+
+        std::shared_ptr<Frame> frame;
+        HRESULT hr = captureSession->CaptureFrame(frame);
+
+        if (FAILED(hr)) {
+            spdlog::error("Error: {}", hr);
+            return;
+        }
+
+        if (!frame) {
+            spdlog::error("Failed to capture frame");
+            continue;
+        }
+        fpsCount++;
+
+        // Scope for lock_guard
+        {
+
+            std::lock_guard<std::mutex> lock{ mtx };
+
+            bool r = frameQueue->emplace(frame);
+            if (!r) {
+                std::cout << "Estourou o limite da queue" << std::endl;
+            }
+
+            cv.notify_one();
+
+        }
+
+        std::this_thread::sleep_until(nextDeadline);
+
+        auto duracao = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - inicio);
+        if (duracao >= std::chrono::seconds(1)) {
+            spdlog::info("FPS: {}", fpsCount);
+            inicio = std::chrono::steady_clock::now();
+            fpsCount = 0;
+        }
+
+    }
+}
+
 HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double frameRate, const std::atomic<bool> *sharing) {
     this->monitor = monitor;
 
@@ -170,40 +258,14 @@ HRESULT CaptureSession::CaptureScreen(const HMONITOR &monitor, const double fram
     if (FAILED(hr))
         return hr;
 
-    auto inicio = std::chrono::steady_clock::now();
-    int fpsCount = 0;
+    FrameQueue frameQueue{ 3 };
+    std::thread t(useFrame, &frameQueue, sharing);
+    std::thread t2(producerFrames, sharing, frameRate, this, &frameQueue);
 
-    std::chrono::duration<double> time_per_frame(1.0 / frameRate);
+    
 
-    auto nextDeadline = std::chrono::steady_clock::now();
-
-    while (sharing->load()) {
-        nextDeadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(time_per_frame);
-
-        std::shared_ptr<Frame> frame;
-        hr = CaptureFrame(frame);
-
-        if (FAILED(hr)) {
-            return hr;
-        }
-
-        if (!frame) {
-            spdlog::error("Failed to capture frame");
-        }
-        fpsCount++;
-
-        
-
-        std::this_thread::sleep_until(nextDeadline);
-
-        auto duracao = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - inicio);
-        if (duracao >= std::chrono::seconds(1)) {
-            spdlog::info("FPS: {}", fpsCount);
-            inicio = std::chrono::steady_clock::now();
-            fpsCount = 0;
-        }
-
-    }
+    t.join();
+    t2.join();
 
     return S_OK;
 }

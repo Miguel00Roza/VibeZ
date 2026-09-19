@@ -5,6 +5,7 @@
 #include <dxgi1_2.h>
 #include <memory>
 #include <atomic>
+#include <mutex>
 
 #include "Frame.hpp"
 #include "TexturePool.hpp"
