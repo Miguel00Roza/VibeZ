@@ -14,7 +14,10 @@ add_executable(VibeZ main.cpp
         client/capture/CaptureSession.cpp
         client/capture/CaptureSession.hpp
         client/capture/TexturePool.cpp
-        client/capture/TexturePool.hpp)
+        client/capture/TexturePool.hpp
+        client/window/Window.hpp
+        client/window/Window.cpp
+)
 
 target_include_directories(VibeZ PRIVATE ${Stb_INCLUDE_DIR})
 
