@@ -69,3 +69,7 @@ void Window::Show() {
 void Window::Update() {
     UpdateWindow(hwnd);
 }
+
+HWND Window::getHwnd() {
+    return hwnd;
+}

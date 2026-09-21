@@ -12,4 +12,5 @@ public:
 
     void Show();
     void Update();
+    HWND getHwnd();
 };
