@@ -1,4 +1,5 @@
 #include "Renderer.hpp"
+#include "../capture/Frame.hpp"
 #include <wrl/client.h> // ComPtr
 #include <d3d11.h>
 #include <dxgi.h>
@@ -31,4 +32,28 @@ void Renderer::RenderColor(float r, float g, float b, float a) {
 	deviceContext->RSSetViewports(1, &viewport);
 
 	swapChain->Present(1, 0);
+}
+
+void Renderer::RenderFrame(Frame &frame) {
+	if (!intermediaryTexture) {
+		D3D11_TEXTURE2D_DESC desc{};
+		frame.frameId3d11Texture2D->GetDesc(&desc);
+
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = 0;
+
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, intermediaryTexture.GetAddressOf());
+		if (FAILED(hr)) {
+			spdlog::error("Failed to create renderer intermediary texture: {}", hr);
+			return;
+		}
+	}
+	
+	deviceContext->CopyResource(intermediaryTexture.Get(), frame.frameId3d11Texture2D.Get());
+
+	HRESULT hr = device->CreateShaderResourceView(intermediaryTexture.Get(), nullptr, shaderResourceView.ReleaseAndGetAddressOf());
+	if (FAILED(hr)) {
+		spdlog::error("Failed to create shader resource view: {}", hr);
+		return;
+	}
 }

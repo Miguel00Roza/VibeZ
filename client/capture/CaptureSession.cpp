@@ -91,7 +91,6 @@ HRESULT CaptureSession::CaptureFrame(std::shared_ptr<Frame> &outFrame) {
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             Sleep(2000);
             // futuramente substituir esse sleep por algo mais correto, isso funciona meio que na gambiarra
-            // TODO: recriar texturePool apos mudança de resolução
 
             hr = Initialize(monitor);
             if (FAILED(hr)) {

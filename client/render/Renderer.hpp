@@ -1,4 +1,5 @@
 #pragma once
+#include "../capture/Frame.hpp"
 #include <wrl/client.h> // ComPtr
 #include <d3d11.h>
 #include <dxgi.h>
@@ -13,8 +14,10 @@ private:
 	HWND hwnd;
 	ComPtr<ID3D11Device> device{};
 	ComPtr<ID3D11DeviceContext> deviceContext{};
+	ComPtr<ID3D11Texture2D> intermediaryTexture{};
 	DXGI_SWAP_CHAIN_DESC swapDesc{};
 	ComPtr<IDXGISwapChain> swapChain{};
+	ComPtr<ID3D11ShaderResourceView> shaderResourceView{};
 	ComPtr<ID3D11RenderTargetView> renderTargetView{};
 
 	void CreateRenderTarget() {
@@ -66,4 +69,5 @@ public:
 
 	void Resize(UINT width, UINT height);
 	void RenderColor(float r, float g, float b, float a = 1.0f);
+	void RenderFrame(Frame &frame);
 };
