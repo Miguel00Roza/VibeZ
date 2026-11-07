@@ -19,6 +19,8 @@ private:
 	ComPtr<IDXGISwapChain> swapChain{};
 	ComPtr<ID3D11ShaderResourceView> shaderResourceView{};
 	ComPtr<ID3D11RenderTargetView> renderTargetView{};
+	ComPtr<ID3D11Buffer> buffer;
+
 
 	void CreateRenderTarget() {
 		ComPtr<ID3D11Texture2D> backBuffer{};

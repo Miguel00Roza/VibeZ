@@ -1,6 +1,23 @@
 {
   "dependencies": [
+    "opus",
     "spdlog",
-    "stb"
+    "stb",
+    {
+      "name": "qtbase",
+      "default-features": false,
+      "features": [
+        "gui",
+        "widgets",
+        "thread",
+        "network",
+        "windeployqt",
+        "freetype",
+        "jpeg",
+        "png",
+        "zstd",
+        "doubleconversion"
+      ]
+    }
   ]
 }

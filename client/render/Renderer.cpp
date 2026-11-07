@@ -56,4 +56,8 @@ void Renderer::RenderFrame(Frame &frame) {
 		spdlog::error("Failed to create shader resource view: {}", hr);
 		return;
 	}
+
+	deviceContext->PSSetShaderResources(0, 1, shaderResourceView.GetAddressOf());
+
+
 }
