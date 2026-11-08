@@ -9,7 +9,7 @@
 
 namespace vibez::protocol {
 
-constexpr std::uint16_t kProtocolVersion = 3;
+constexpr std::uint16_t kProtocolVersion = 4;
 constexpr std::uint32_t kControlMagic = 0x56495A45; // "VIZE"
 constexpr std::uint32_t kMediaMagic = 0x565A4D31;   // "VZM1"
 constexpr std::size_t kMaxControlPayload = 64 * 1024;
@@ -18,6 +18,10 @@ constexpr std::size_t kMediaHeaderSize = 34;
 constexpr std::size_t kMaxVideoFrameBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxVideoFragments = 2048;
 constexpr std::uint8_t kMediaFlagKeyframe = 0x01;
+// Marks an audio datagram that carries the shared computer sound instead of
+// the microphone. Two independent streams let the receiver control the voice
+// and the screen-audio volume separately.
+constexpr std::uint8_t kMediaFlagSystemAudio = 0x02;
 
 enum class ControlType : std::uint8_t {
     Hello = 1, HelloAccepted = 2, Error = 3, CreateChannel = 4, RemoveChannel = 5,
@@ -25,7 +29,7 @@ enum class ControlType : std::uint8_t {
     SetSharing = 11, RequestKeyframe = 12, ChatMessage = 13,
 };
 
-enum class MediaType : std::uint8_t { Audio = 1, Video = 2 };
+enum class MediaType : std::uint8_t { Audio = 1, Video = 2, Keepalive = 3 };
 
 struct ControlMessage { ControlType type{}; std::uint32_t requestId{}; std::vector<std::uint8_t> payload; };
 

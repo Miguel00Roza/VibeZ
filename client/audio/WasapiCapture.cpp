@@ -1,6 +1,7 @@
 #include "client/audio/WasapiCapture.hpp"
 
 #include "client/audio/AudioFormat.hpp"
+#include "client/audio/AudioThread.hpp"
 
 #include <windows.h>
 #include <audioclient.h>
@@ -68,37 +69,59 @@ struct WasapiCapture::Impl {
         running.store(false);
     }
 
-    void Run() {
+    void ThreadMain() {
+        AudioThreadScope audioThread;
+        bool firstAttempt = true;
+        int backoffMs = 250;
+        while (!stopping.load()) {
+            bool started = false;
+            (void)RunOnce(started);
+            running.store(false);
+            if (stopping.load()) break;
+            if (!started && firstAttempt) return; // Start() already reported the failure.
+            firstAttempt = false;
+            for (int waited = 0; waited < backoffMs && !stopping.load(); waited += 50) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            backoffMs = (std::min)(backoffMs * 2, 5000);
+        }
+    }
+
+    bool RunOnce(bool& started) {
+        started = false;
         const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool ownsCom = comResult == S_OK || comResult == S_FALSE;
         if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) {
-            CompleteInitialization(false, "COM initialization failed for the capture thread");
+            if (!initialized) CompleteInitialization(false, "COM initialization failed for the capture thread");
             if (ownsCom) CoUninitialize();
-            return;
+            return false;
         }
 
         ComPtr<IMMDeviceEnumerator> enumerator;
         ComPtr<IMMDevice> device;
         ComPtr<IAudioClient> audioClient;
         ComPtr<IAudioCaptureClient> captureClient;
-        std::string error;
+        bool audioStarted = false;
 
         auto fail = [&](const std::string& message) {
-            CompleteInitialization(false, message);
+            if (!initialized) CompleteInitialization(false, message);
+            if (audioClient && audioStarted) audioClient->Stop();
             if (ownsCom) CoUninitialize();
+            running.store(false);
+            return false;
         };
 
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(enumerator.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("CoCreateInstance(MMDeviceEnumerator)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("CoCreateInstance(MMDeviceEnumerator)", hr));
         if (deviceId.empty()) {
             hr = enumerator->GetDefaultAudioEndpoint(source == CaptureSource::SystemLoopback ? eRender : eCapture,
                                                      eConsole, device.GetAddressOf());
         } else {
             hr = enumerator->GetDevice(deviceId.c_str(), device.GetAddressOf());
         }
-        if (FAILED(hr)) { fail(HResultText("Open capture device", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Open capture device", hr));
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(audioClient.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("Activate(IAudioClient)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Activate(IAudioClient)", hr));
 
         WAVEFORMATEX format{};
         format.wFormatTag = WAVE_FORMAT_PCM;
@@ -112,16 +135,18 @@ struct WasapiCapture::Impl {
         DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         if (source == CaptureSource::SystemLoopback) flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
         hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kCaptureBufferDuration, 0, &format, nullptr);
-        if (FAILED(hr)) { fail(HResultText("Initialize shared-mode 48 kHz mono capture", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Initialize shared-mode 48 kHz mono capture", hr));
         hr = audioClient->SetEventHandle(audioEvent);
-        if (FAILED(hr)) { fail(HResultText("SetEventHandle(capture)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("SetEventHandle(capture)", hr));
         hr = audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(captureClient.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("GetService(IAudioCaptureClient)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("GetService(IAudioCaptureClient)", hr));
         hr = audioClient->Start();
-        if (FAILED(hr)) { fail(HResultText("Start(capture)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Start(capture)", hr));
+        audioStarted = true;
+        started = true;
 
         running.store(true);
-        CompleteInitialization(true);
+        if (!initialized) CompleteInitialization(true);
 
         PcmFramer framer;
         std::uint64_t timestamp = 0;
@@ -136,8 +161,7 @@ struct WasapiCapture::Impl {
                 const HRESULT result = captureClient->GetBuffer(&data, &frames, &bufferFlags, nullptr, nullptr);
                 if (result == AUDCLNT_S_BUFFER_EMPTY || frames == 0) break;
                 if (FAILED(result)) {
-                    stopping.store(true);
-                    break;
+                    return fail(HResultText("GetBuffer(capture)", result));
                 }
                 if (bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) {
                     std::size_t remaining = frames;
@@ -159,9 +183,10 @@ struct WasapiCapture::Impl {
             }
         }
 
-        audioClient->Stop();
+        if (audioStarted) audioClient->Stop();
         running.store(false);
         if (ownsCom) CoUninitialize();
+        return true;
     }
 };
 
@@ -185,7 +210,7 @@ bool WasapiCapture::Start(const std::wstring& deviceId, FrameCallback callback, 
         error = "Could not create the WASAPI capture event";
         return false;
     }
-    impl_->thread = std::thread([this] { impl_->Run(); });
+    impl_->thread = std::thread([this] { impl_->ThreadMain(); });
     std::unique_lock lock(impl_->mutex);
     if (!impl_->ready.wait_for(lock, std::chrono::seconds(5), [this] { return impl_->initialized; })) {
         error = "Timed out while starting WASAPI capture";

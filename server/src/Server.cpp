@@ -1,5 +1,7 @@
 #include "server/include/vibez/server/Server.hpp"
 #include "common/protocol/Protocol.hpp"
+#include "server/src/ScreenStream.hpp"
+#include "server/src/WebServer.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -19,6 +21,8 @@ using vibez::protocol::ControlType;
 
 constexpr std::uint32_t kLobbyChannel = 1;
 constexpr std::size_t kMaxChannels = 32;
+constexpr int kUdpSocketBufferBytes = 4 * 1024 * 1024;
+constexpr std::size_t kMaxDatagramsPerDrain = 512;
 
 struct Channel { std::uint32_t id; std::string name; };
 struct Session {
@@ -89,6 +93,8 @@ struct Server::Impl {
     std::vector<Channel> channels{{kLobbyChannel, "Lobby"}};
     std::uint32_t nextSessionId{1};
     std::uint32_t nextChannelId{2};
+    std::shared_ptr<ScreenStreamHub> hub{std::make_shared<ScreenStreamHub>()};
+    std::unique_ptr<WebServer> web;
 
     void CloseSession(const SOCKET socket) {
         const auto it = sessions.find(socket);
@@ -135,6 +141,26 @@ struct Server::Impl {
             writer.String(session.name, 32);
         }
         Broadcast(ControlType::PresenceSnapshot, writer.Data());
+        SyncStreamSessions();
+    }
+
+    [[nodiscard]] std::string ChannelName(const std::uint32_t id) const {
+        const auto it = std::find_if(channels.begin(), channels.end(), [id](const Channel& channel) { return channel.id == id; });
+        return it == channels.end() ? "Canal " + std::to_string(id) : it->name;
+    }
+
+    // Mirrors the participant list into the frame hub so the web viewer knows
+    // who is sharing, their display name and channel, and forgets everyone who
+    // left or stopped sharing.
+    void SyncStreamSessions() {
+        std::vector<SessionInfo> list;
+        list.reserve(sessions.size());
+        for (const auto& [socket, session] : sessions) {
+            if (!session.authenticated) continue;
+            list.push_back({session.id, session.name, session.channel, ChannelName(session.channel),
+                            session.sharing, session.shareWidth, session.shareHeight});
+        }
+        hub->SyncSessions(list);
     }
 
     void BroadcastChannel(const std::uint32_t channelId, const ControlType type,
@@ -241,22 +267,77 @@ struct Server::Impl {
         HandleAuthenticated(session, message);
     }
 
-    void RelayMedia() {
-        std::array<std::uint8_t, protocol::kMaxMediaPayload + 32> buffer{}; sockaddr_in sender{}; int senderSize = sizeof(sender);
-        const int received = recvfrom(udpSocket, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0, reinterpret_cast<sockaddr*>(&sender), &senderSize);
-        if (received <= 0) return;
-        const auto packet = std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received));
-        const auto header = protocol::DecodeMediaHeader(packet);
-        if (!header) return;
-        const auto source = std::find_if(sessions.begin(), sessions.end(), [&](const auto& pair) {
-            return pair.second.authenticated && pair.second.id == header->sessionId && pair.second.tcpAddress.sin_addr.s_addr == sender.sin_addr.s_addr;
-        });
-        if (source == sessions.end()) return;
-        if (header->type == protocol::MediaType::Audio && source->second.muted) return;
-        if (header->type == protocol::MediaType::Video && !source->second.sharing) return;
+    void RelayToChannel(const std::uint8_t* data, const std::size_t size, const std::uint32_t channelId,
+                        const std::uint32_t sourceId) {
         for (const auto& [socket, recipient] : sessions) {
-            if (!recipient.authenticated || recipient.id == source->second.id || recipient.channel != source->second.channel) continue;
-            sendto(udpSocket, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0, reinterpret_cast<const sockaddr*>(&recipient.udpAddress), sizeof(recipient.udpAddress));
+            if (!recipient.authenticated || recipient.id == sourceId || recipient.channel != channelId) continue;
+            sendto(udpSocket, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
+                   reinterpret_cast<const sockaddr*>(&recipient.udpAddress), sizeof(recipient.udpAddress));
+        }
+    }
+
+    void RelayMedia() {
+        std::array<std::uint8_t, protocol::kMaxMediaPayload + 32> buffer{};
+        struct PendingVideo {
+            std::vector<std::uint8_t> packet;
+            std::uint32_t channel{};
+            std::uint32_t source{};
+        };
+        std::vector<PendingVideo> videos;
+
+        for (std::size_t processed = 0; processed < kMaxDatagramsPerDrain; ++processed) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(udpSocket, &readable);
+            timeval timeout{0, 0};
+            if (select(0, &readable, nullptr, nullptr, &timeout) <= 0) break;
+
+            sockaddr_in sender{};
+            int senderSize = sizeof(sender);
+            const int received = recvfrom(udpSocket, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0,
+                                          reinterpret_cast<sockaddr*>(&sender), &senderSize);
+            if (received <= 0) break;
+            const auto packet = std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received));
+            const auto header = protocol::DecodeMediaHeader(packet);
+            if (!header) continue;
+            const auto source = std::find_if(sessions.begin(), sessions.end(), [&](const auto& pair) {
+                return pair.second.authenticated && pair.second.id == header->sessionId;
+            });
+            if (source == sessions.end()) continue;
+            // The UDP sender must come from the same host as the TCP session.
+            // NAT changes the port but not the public address, so this keeps
+            // relayed media authenticated without trusting the advertised port.
+            if (sender.sin_addr.s_addr != source->second.tcpAddress.sin_addr.s_addr) continue;
+
+            // Always learn the real UDP endpoint (including NAT-mapped ports)
+            // so relayed media goes back to where the packet actually came from.
+            source->second.udpAddress = sender;
+
+            if (header->type == protocol::MediaType::Keepalive) continue;
+            if (header->type == protocol::MediaType::Video) {
+                if (!source->second.sharing) continue;
+                // Feed the browser viewer before relaying: the frames are
+                // already here and the hub only keeps the latest one.
+                if (web) hub->PushFragment(*header, packet.subspan(protocol::kMediaHeaderSize));
+                if (videos.size() < kMaxDatagramsPerDrain) {
+                    videos.push_back({std::vector<std::uint8_t>(packet.begin(), packet.end()),
+                                      source->second.channel, source->second.id});
+                }
+                continue;
+            }
+
+            const bool systemAudio = (header->flags & protocol::kMediaFlagSystemAudio) != 0;
+            if (systemAudio) {
+                if (!source->second.sharing) continue;
+            } else if (source->second.muted) {
+                continue;
+            }
+            // Relay audio immediately so a video burst never starves the voice.
+            RelayToChannel(packet.data(), packet.size(), source->second.channel, source->second.id);
+        }
+
+        for (const auto& video : videos) {
+            RelayToChannel(video.packet.data(), video.packet.size(), video.channel, video.source);
         }
     }
 };
@@ -265,12 +346,32 @@ Server::Server(const std::uint16_t port) : port_(port), impl_(std::make_unique<I
 Server::~Server() { RequestStop(); }
 void Server::RequestStop() noexcept { stop_.store(true); }
 
+void Server::SetWebConfig(const WebConfig& config) {
+    webConfig_ = config;
+    webEnabled_ = true;
+}
+
+std::uint16_t Server::WebPort() const noexcept { return webPort_.load(); }
+
 bool Server::Run() {
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) { std::cerr << "WSAStartup failed\n"; return false; }
-    const auto cleanup = [this] { for (const auto& [socket, session] : impl_->sessions) closesocket(socket); impl_->sessions.clear(); if (impl_->tcpListener != INVALID_SOCKET) closesocket(impl_->tcpListener); if (impl_->udpSocket != INVALID_SOCKET) closesocket(impl_->udpSocket); WSACleanup(); };
+    const auto cleanup = [this] {
+        // The viewer threads read frames from the hub, so stop them before the
+        // sockets (and then WSA) are torn down.
+        if (impl_->web) { impl_->web->Stop(); impl_->web.reset(); }
+        webPort_.store(0);
+        for (const auto& [socket, session] : impl_->sessions) closesocket(socket);
+        impl_->sessions.clear();
+        if (impl_->tcpListener != INVALID_SOCKET) closesocket(impl_->tcpListener);
+        if (impl_->udpSocket != INVALID_SOCKET) closesocket(impl_->udpSocket);
+        WSACleanup();
+    };
     impl_->tcpListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); impl_->udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl_->tcpListener == INVALID_SOCKET || impl_->udpSocket == INVALID_SOCKET) { std::cerr << "Socket creation failed\n"; cleanup(); return false; }
+    int udpBuffer = kUdpSocketBufferBytes;
+    setsockopt(impl_->udpSocket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&udpBuffer), sizeof(udpBuffer));
+    setsockopt(impl_->udpSocket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&udpBuffer), sizeof(udpBuffer));
     sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_ANY); address.sin_port = htons(port_);
     if (bind(impl_->tcpListener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR || listen(impl_->tcpListener, SOMAXCONN) == SOCKET_ERROR || bind(impl_->udpSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) { std::cerr << "Cannot bind TCP/UDP port " << port_ << " (error " << WSAGetLastError() << ")\n"; cleanup(); return false; }
     std::cout << "VibeZ server listening on TCP/UDP " << port_ << "\n";
@@ -283,6 +384,29 @@ bool Server::Run() {
         std::cout << "For friends outside your network, use your public IP and forward TCP/UDP port " << port_ << ".\n";
     }
     std::cout << std::flush;
+    if (webEnabled_) {
+        impl_->web = std::make_unique<WebServer>(impl_->hub);
+        WebServerConfig config;
+        config.port = webConfig_.port;
+        config.bindAddress = webConfig_.bindAddress;
+        config.maxViewers = webConfig_.maxViewers;
+        std::string webError;
+        if (impl_->web->Start(config, webError)) {
+            const auto webPort = impl_->web->Port();
+            webPort_.store(webPort);
+            std::cout << "\nWeb viewer for the shared screen:\n";
+            if (addresses.empty()) {
+                std::cout << "  http://127.0.0.1:" << webPort << "\n";
+            } else {
+                for (const auto& ip : addresses) std::cout << "  http://" << ip << ':' << webPort << "\n";
+            }
+            std::cout << "Open it on a PC or phone; allow TCP " << webPort << " through the firewall.\n";
+        } else {
+            std::cerr << "Web viewer disabled: " << webError << "\n";
+            impl_->web.reset();
+        }
+        std::cout << std::flush;
+    }
     while (!stop_.load()) {
         fd_set readable; FD_ZERO(&readable); FD_SET(impl_->tcpListener, &readable); FD_SET(impl_->udpSocket, &readable);
         for (const auto& [socket, session] : impl_->sessions) FD_SET(socket, &readable);

@@ -66,7 +66,10 @@ public:
     bool SendControl(protocol::ControlType type, std::span<const std::uint8_t> payload = {});
 
     // The session id is added automatically once Hello has been accepted.
-    bool SendAudio(std::uint32_t sequence, std::uint64_t timestamp, std::span<const std::uint8_t> payload);
+    // systemAudio selects the independent shared-computer-sound stream.
+    bool SendAudio(std::uint32_t sequence, std::uint64_t timestamp, std::span<const std::uint8_t> payload,
+                   bool systemAudio = false);
+    bool SendKeepalive();
     bool SendVideo(std::uint32_t sequence, std::uint64_t timestamp, std::uint8_t flags, std::uint32_t frameId,
                    std::uint16_t fragmentIndex, std::uint16_t fragmentCount,
                    std::span<const std::uint8_t> payload);

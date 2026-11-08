@@ -8,15 +8,23 @@ bool IsControlType(const std::uint8_t value) {
     return value >= static_cast<std::uint8_t>(ControlType::Hello) && value <= static_cast<std::uint8_t>(ControlType::ChatMessage);
 }
 bool IsMediaType(const std::uint8_t value) {
-    return value == static_cast<std::uint8_t>(MediaType::Audio) || value == static_cast<std::uint8_t>(MediaType::Video);
+    return value == static_cast<std::uint8_t>(MediaType::Audio) ||
+           value == static_cast<std::uint8_t>(MediaType::Video) ||
+           value == static_cast<std::uint8_t>(MediaType::Keepalive);
 }
 bool IsValidMediaHeader(const MediaHeader& header) {
     if (header.payloadSize > kMaxMediaPayload || !IsMediaType(static_cast<std::uint8_t>(header.type))) return false;
-    if ((header.flags & static_cast<std::uint8_t>(~kMediaFlagKeyframe)) != 0) return false;
     if (header.fragmentCount == 0 || header.fragmentCount > kMaxVideoFragments || header.fragmentIndex >= header.fragmentCount) return false;
     if (header.type == MediaType::Audio) {
+        const auto allowed = static_cast<std::uint8_t>(kMediaFlagSystemAudio);
+        if ((header.flags & static_cast<std::uint8_t>(~allowed)) != 0) return false;
         return header.fragmentCount == 1 && header.fragmentIndex == 0 && header.frameId == 0;
     }
+    if (header.type == MediaType::Keepalive) {
+        return header.flags == 0 && header.payloadSize == 0 && header.fragmentCount == 1 &&
+               header.fragmentIndex == 0 && header.frameId == 0;
+    }
+    if ((header.flags & static_cast<std::uint8_t>(~kMediaFlagKeyframe)) != 0) return false;
     return header.frameId != 0;
 }
 } // namespace

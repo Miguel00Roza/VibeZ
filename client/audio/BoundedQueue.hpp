@@ -51,7 +51,8 @@ public:
 
     [[nodiscard]] bool TryPush(T value) {
         std::lock_guard lock(mutex_);
-        if (closed_ || capacity_ == 0 || queue_.size() >= capacity_) return false;
+        if (closed_ || capacity_ == 0) return false;
+        while (queue_.size() >= capacity_) queue_.pop();
         queue_.push(std::move(value));
         ready_.notify_one();
         return true;

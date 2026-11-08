@@ -24,6 +24,9 @@ constexpr int kInitialBackoffMs = 500;
 constexpr int kMaxBackoffMs = 5000;
 constexpr std::size_t kMaxPresenceUsers = 4096;
 constexpr std::size_t kMaxChannels = 1024;
+constexpr int kUdpSocketBufferBytes = 4 * 1024 * 1024;
+constexpr std::size_t kMaxDatagramsPerDrain = 256;
+constexpr auto kKeepaliveInterval = std::chrono::seconds(5);
 
 NetworkEvent MakeStateEvent(const ConnectionState value) {
     NetworkEvent event;
@@ -147,6 +150,19 @@ struct NetworkClient::Impl {
         return SendTcp(protocol::EncodeControl(message));
     }
 
+    // Sends an empty media datagram so NAT devices keep the UDP mapping open
+    // and the server keeps learning this client's real UDP endpoint.
+    bool SendKeepaliveInternal() {
+        if (!running.load()) return false;
+        const auto ownId = sessionId.load();
+        if (ownId == 0) return false;
+        const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const protocol::MediaHeader header{MediaType::Keepalive, ownId, 0, now, 0};
+        const auto bytes = protocol::EncodeMediaHeader(header);
+        return !bytes.empty() && SendUdp(bytes);
+    }
+
     bool CreateSockets() {
         sockaddr_in server{};
         if (!ResolveServer(config.host, config.port, server)) {
@@ -170,6 +186,9 @@ struct NetworkClient::Impl {
             return false;
         }
         const auto udpPort = ntohs(local.sin_port);
+        int udpBuffer = kUdpSocketBufferBytes;
+        setsockopt(udp, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&udpBuffer), sizeof(udpBuffer));
+        setsockopt(udp, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&udpBuffer), sizeof(udpBuffer));
 
         const SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (tcp == INVALID_SOCKET) {
@@ -354,43 +373,62 @@ struct NetworkClient::Impl {
 
     void HandleMedia(const SOCKET udp) {
         std::array<std::uint8_t, protocol::kMaxMediaPayload + 32> buffer{};
-        sockaddr_in sender{};
-        int senderSize = sizeof(sender);
-        const int received = recvfrom(udp, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0,
-                                      reinterpret_cast<sockaddr*>(&sender), &senderSize);
-        if (received <= 0) return;
-        const auto header = protocol::DecodeMediaHeader(
-            std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received)));
-        if (!header) return;
-        const auto ownId = sessionId.load();
-        if (ownId != 0 && header->sessionId == ownId) return;
+        for (std::size_t processed = 0; processed < kMaxDatagramsPerDrain; ++processed) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(udp, &readable);
+            timeval timeout{0, 0};
+            if (select(0, &readable, nullptr, nullptr, &timeout) <= 0) return;
 
-        MediaPacket packet;
-        packet.type = header->type;
-        packet.sessionId = header->sessionId;
-        packet.sequence = header->sequence;
-        packet.timestamp = header->timestamp;
-        packet.flags = header->flags;
-        packet.frameId = header->frameId;
-        packet.fragmentIndex = header->fragmentIndex;
-        packet.fragmentCount = header->fragmentCount;
-        packet.payload.assign(
-            buffer.begin() + static_cast<std::ptrdiff_t>(protocol::kMediaHeaderSize),
-            buffer.begin() + static_cast<std::ptrdiff_t>(received));
+            sockaddr_in sender{};
+            int senderSize = sizeof(sender);
+            const int received = recvfrom(udp, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0,
+                                          reinterpret_cast<sockaddr*>(&sender), &senderSize);
+            if (received <= 0) return;
+            const auto header = protocol::DecodeMediaHeader(
+                std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received)));
+            if (!header) continue;
+            if (header->type == protocol::MediaType::Keepalive) continue;
+            const auto ownId = sessionId.load();
+            if (ownId != 0 && header->sessionId == ownId) continue;
 
-        MediaSink sink;
-        {
-            std::lock_guard lock(sinkMutex);
-            sink = packet.type == MediaType::Audio ? audioSink : videoSink;
+            MediaPacket packet;
+            packet.type = header->type;
+            packet.sessionId = header->sessionId;
+            packet.sequence = header->sequence;
+            packet.timestamp = header->timestamp;
+            packet.flags = header->flags;
+            packet.frameId = header->frameId;
+            packet.fragmentIndex = header->fragmentIndex;
+            packet.fragmentCount = header->fragmentCount;
+            packet.payload.assign(
+                buffer.begin() + static_cast<std::ptrdiff_t>(protocol::kMediaHeaderSize),
+                buffer.begin() + static_cast<std::ptrdiff_t>(received));
+
+            MediaSink sink;
+            {
+                std::lock_guard lock(sinkMutex);
+                sink = packet.type == MediaType::Audio ? audioSink : videoSink;
+            }
+            if (sink) sink(packet);
         }
-        if (sink) sink(packet);
     }
 
     // Returns false when the connection ended unexpectedly (so Run can emit a
     // diagnostic); stopping is handled without an error.
     bool ReceiveLoop() {
         std::vector<std::uint8_t> stream;
+        // Send the first keepalive as soon as the session exists so the NAT
+        // mapping and the server's UDP endpoint are established even when the
+        // microphone is muted and no audio is flowing.
+        auto nextKeepalive = std::chrono::steady_clock::now();
         while (!stopping.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= nextKeepalive) {
+                nextKeepalive = SendKeepaliveInternal()
+                    ? now + kKeepaliveInterval
+                    : now + std::chrono::milliseconds(500);
+            }
             SOCKET tcp = INVALID_SOCKET;
             SOCKET udp = INVALID_SOCKET;
             {
@@ -521,17 +559,21 @@ bool NetworkClient::SendControl(const ControlType type, const std::span<const st
     return impl_->SendControlInternal(type, payload);
 }
 
-bool NetworkClient::SendAudio(const std::uint32_t sequence, const std::uint64_t timestamp, const std::span<const std::uint8_t> payload) {
+bool NetworkClient::SendAudio(const std::uint32_t sequence, const std::uint64_t timestamp, const std::span<const std::uint8_t> payload,
+                              const bool systemAudio) {
     if (!impl_->running.load() || payload.empty() || payload.size() > protocol::kMaxMediaPayload) return false;
     const auto ownId = impl_->sessionId.load();
     if (ownId == 0) return false;
-    const protocol::MediaHeader header{MediaType::Audio, ownId, sequence, timestamp, static_cast<std::uint16_t>(payload.size())};
+    const auto flags = static_cast<std::uint8_t>(systemAudio ? protocol::kMediaFlagSystemAudio : 0);
+    const protocol::MediaHeader header{MediaType::Audio, ownId, sequence, timestamp, static_cast<std::uint16_t>(payload.size()), flags};
     const auto headerBytes = protocol::EncodeMediaHeader(header);
     if (headerBytes.empty()) return false;
     std::vector<std::uint8_t> packet = headerBytes;
     packet.insert(packet.end(), payload.begin(), payload.end());
     return impl_->SendUdp(packet);
 }
+
+bool NetworkClient::SendKeepalive() { return impl_->SendKeepaliveInternal(); }
 
 bool NetworkClient::SendVideo(const std::uint32_t sequence, const std::uint64_t timestamp, const std::uint8_t flags,
                               const std::uint32_t frameId, const std::uint16_t fragmentIndex,

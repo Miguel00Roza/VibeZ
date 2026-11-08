@@ -32,11 +32,14 @@ public:
     bool setSharing(bool sharing, quint16 width, quint16 height);
     bool setSystemAudioEnabled(bool enabled, QString& error);
     [[nodiscard]] bool systemAudioEnabled() const;
-    bool sendScreenFrame(const QByteArray& jpeg);
+    bool sendScreenFrame(const QByteArray& jpeg, bool keyframe = false);
+    void setVideoBitrate(double bitrateBps);
     bool requestKeyframe(quint32 targetId);
     bool sendChat(const QString& text);
     void setUserVolume(quint32 userId, float volume);
     void setUserMuted(quint32 userId, bool muted);
+    void setUserScreenVolume(quint32 userId, float volume);
+    bool restartAudio(QString& error);
 
     [[nodiscard]] vibez::client::ConnectionState state() const;
     [[nodiscard]] quint32 sessionId() const;
@@ -46,7 +49,9 @@ public:
     [[nodiscard]] QString audioError() const;
     [[nodiscard]] float localLevel() const;
     [[nodiscard]] float userLevel(quint32 userId) const;
+    [[nodiscard]] float userScreenLevel(quint32 userId) const;
     [[nodiscard]] quint64 receivedPackets() const;
+    [[nodiscard]] quint64 receivedSystemPackets() const;
 
 signals:
     void connectionStateChanged();
@@ -68,5 +73,6 @@ private:
     std::uint32_t sessionId_{};
     std::vector<vibez::client::ChannelInfo> channels_;
     std::vector<vibez::client::UserInfo> users_;
+    double videoBitrateBps_{vibez::client::kVideoTargetBitrateBps};
     bool running_{};
 };

@@ -6,6 +6,9 @@
 int main() {
     using namespace vibez::protocol;
 
+    CHECK(kProtocolVersion == 4);
+    CHECK(kMediaFlagSystemAudio == 0x02);
+
     Writer payload;
     CHECK(payload.String("Miguel", 32));
     payload.U16(28765);
@@ -44,6 +47,33 @@ int main() {
     MediaHeader invalidAudio = audio;
     invalidAudio.fragmentCount = 2;
     CHECK(EncodeMediaHeader(invalidAudio).empty());
+
+    // The microphone stream never carries a keyframe flag; the shared computer
+    // sound is identified only by kMediaFlagSystemAudio.
+    MediaHeader systemAudio = audio;
+    systemAudio.flags = kMediaFlagSystemAudio;
+    auto systemPacket = EncodeMediaHeader(systemAudio);
+    CHECK(systemPacket.size() == kMediaHeaderSize);
+    systemPacket.insert(systemPacket.end(), {1, 2, 3});
+    const auto readSystem = DecodeMediaHeader(systemPacket);
+    CHECK(readSystem && (readSystem->flags & kMediaFlagSystemAudio) != 0);
+    MediaHeader audioKeyframe = audio;
+    audioKeyframe.flags = kMediaFlagKeyframe;
+    CHECK(EncodeMediaHeader(audioKeyframe).empty());
+    MediaHeader audioUnknownFlag = audio;
+    audioUnknownFlag.flags = 0x80;
+    CHECK(EncodeMediaHeader(audioUnknownFlag).empty());
+
+    // Keepalive datagrams carry no payload and exist only to keep the NAT
+    // mapping and the server-side endpoint learning alive.
+    const MediaHeader keepalive{MediaType::Keepalive, 7, 0, 999, 0};
+    const auto keepalivePacket = EncodeMediaHeader(keepalive);
+    CHECK(keepalivePacket.size() == kMediaHeaderSize);
+    const auto readKeepalive = DecodeMediaHeader(keepalivePacket);
+    CHECK(readKeepalive && readKeepalive->type == MediaType::Keepalive && readKeepalive->payloadSize == 0);
+    MediaHeader invalidKeepalive = keepalive;
+    invalidKeepalive.payloadSize = 1;
+    CHECK(EncodeMediaHeader(invalidKeepalive).empty());
 
     MediaHeader invalidVideo = video;
     invalidVideo.fragmentIndex = invalidVideo.fragmentCount;

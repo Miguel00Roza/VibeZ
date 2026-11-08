@@ -1,6 +1,7 @@
 #include "client/audio/WasapiPlayback.hpp"
 
 #include "client/audio/AudioFormat.hpp"
+#include "client/audio/AudioThread.hpp"
 
 #include <windows.h>
 #include <audioclient.h>
@@ -64,35 +65,58 @@ struct WasapiPlayback::Impl {
         running.store(false);
     }
 
-    void Run() {
+    void ThreadMain() {
+        AudioThreadScope audioThread;
+        bool firstAttempt = true;
+        int backoffMs = 250;
+        while (!stopping.load()) {
+            bool started = false;
+            (void)RunOnce(started);
+            running.store(false);
+            if (stopping.load()) break;
+            if (!started && firstAttempt) return;
+            firstAttempt = false;
+            for (int waited = 0; waited < backoffMs && !stopping.load(); waited += 50) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            backoffMs = (std::min)(backoffMs * 2, 5000);
+        }
+    }
+
+    bool RunOnce(bool& started) {
+        started = false;
         const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool ownsCom = comResult == S_OK || comResult == S_FALSE;
         if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) {
-            CompleteInitialization(false, "COM initialization failed for the playback thread");
+            if (!initialized) CompleteInitialization(false, "COM initialization failed for the playback thread");
             if (ownsCom) CoUninitialize();
-            return;
+            return false;
         }
 
         ComPtr<IMMDeviceEnumerator> enumerator;
         ComPtr<IMMDevice> device;
         ComPtr<IAudioClient> audioClient;
         ComPtr<IAudioRenderClient> renderClient;
+        bool audioStarted = false;
 
         auto fail = [&](const std::string& message) {
-            CompleteInitialization(false, message);
+            if (!initialized) CompleteInitialization(false, message);
+            if (audioClient && audioStarted) audioClient->Stop();
             if (ownsCom) CoUninitialize();
+            running.store(false);
+            return false;
         };
 
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(enumerator.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("CoCreateInstance(MMDeviceEnumerator)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("CoCreateInstance(MMDeviceEnumerator)", hr));
         if (deviceId.empty()) {
             hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.GetAddressOf());
         } else {
             hr = enumerator->GetDevice(deviceId.c_str(), device.GetAddressOf());
         }
-        if (FAILED(hr)) { fail(HResultText("Open playback device", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Open playback device", hr));
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(audioClient.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("Activate(IAudioClient)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Activate(IAudioClient)", hr));
 
         WAVEFORMATEX format{};
         format.wFormatTag = WAVE_FORMAT_PCM;
@@ -105,17 +129,19 @@ struct WasapiPlayback::Impl {
 
         const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kPlaybackBufferDuration, 0, &format, nullptr);
-        if (FAILED(hr)) { fail(HResultText("Initialize shared-mode 48 kHz mono playback", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Initialize shared-mode 48 kHz mono playback", hr));
         UINT32 bufferFrames{};
         hr = audioClient->GetBufferSize(&bufferFrames);
-        if (FAILED(hr) || bufferFrames == 0) { fail(HResultText("GetBufferSize(playback)", hr)); return; }
+        if (FAILED(hr) || bufferFrames == 0) return fail(HResultText("GetBufferSize(playback)", hr));
         hr = audioClient->SetEventHandle(audioEvent);
-        if (FAILED(hr)) { fail(HResultText("SetEventHandle(playback)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("SetEventHandle(playback)", hr));
         hr = audioClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(renderClient.GetAddressOf()));
-        if (FAILED(hr)) { fail(HResultText("GetService(IAudioRenderClient)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("GetService(IAudioRenderClient)", hr));
 
         hr = audioClient->Start();
-        if (FAILED(hr)) { fail(HResultText("Start(playback)", hr)); return; }
+        if (FAILED(hr)) return fail(HResultText("Start(playback)", hr));
+        audioStarted = true;
+        started = true;
 
         // Fill the initial device buffer after starting; a failed prefill is
         // harmless because the event loop will fill it on the next callback.
@@ -126,28 +152,32 @@ struct WasapiPlayback::Impl {
         }
 
         running.store(true);
-        CompleteInitialization(true);
+        if (!initialized) CompleteInitialization(true);
 
         while (!stopping.load()) {
             const DWORD wait = WaitForSingleObject(audioEvent, 100);
             if (wait != WAIT_OBJECT_0) continue;
             UINT32 padding{};
-            if (FAILED(audioClient->GetCurrentPadding(&padding))) {
-                stopping.store(true);
-                break;
+            const HRESULT paddingResult = audioClient->GetCurrentPadding(&padding);
+            if (FAILED(paddingResult)) {
+                return fail(HResultText("GetCurrentPadding(playback)", paddingResult));
             }
             const UINT32 available = bufferFrames > padding ? bufferFrames - padding : 0;
             if (available == 0) continue;
             BYTE* data = nullptr;
-            if (FAILED(renderClient->GetBuffer(available, &data)) || !data) continue;
+            const HRESULT bufferResult = renderClient->GetBuffer(available, &data);
+            if (FAILED(bufferResult) || !data) {
+                return fail(HResultText("GetBuffer(playback)", FAILED(bufferResult) ? bufferResult : E_POINTER));
+            }
             const auto samples = std::span<std::int16_t>(reinterpret_cast<std::int16_t*>(data), static_cast<std::size_t>(available) * kChannels);
             if (callback) callback(samples); else std::fill(samples.begin(), samples.end(), std::int16_t{0});
             renderClient->ReleaseBuffer(available, 0);
         }
 
-        audioClient->Stop();
+        if (audioStarted) audioClient->Stop();
         running.store(false);
         if (ownsCom) CoUninitialize();
+        return true;
     }
 };
 
@@ -170,7 +200,7 @@ bool WasapiPlayback::Start(const std::wstring& deviceId, FillCallback callback, 
         error = "Could not create the WASAPI playback event";
         return false;
     }
-    impl_->thread = std::thread([this] { impl_->Run(); });
+    impl_->thread = std::thread([this] { impl_->ThreadMain(); });
     std::unique_lock lock(impl_->mutex);
     if (!impl_->ready.wait_for(lock, std::chrono::seconds(5), [this] { return impl_->initialized; })) {
         error = "Timed out while starting WASAPI playback";

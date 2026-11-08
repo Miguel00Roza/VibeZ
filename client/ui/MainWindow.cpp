@@ -40,6 +40,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -86,6 +87,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), controller_(new S
     });
     connect(controller_, &SessionController::keyframeRequested, this, [this](const quint32 requesterId) {
         appendLog(QStringLiteral("Keyframe solicitado por #%1.").arg(requesterId));
+        // The next captured frame is sent as a keyframe so the remote viewer can
+        // rebuild its decoder state instead of waiting for the next periodic one.
+        forceKeyframe_ = true;
     });
     connect(controller_, &SessionController::videoFrameReceived, this, &MainWindow::onVideoFrameReceived);
     connect(controller_, &SessionController::chatMessageReceived, this,
@@ -212,6 +216,8 @@ QWidget* MainWindow::buildRoomPage() {
     shareButton_->setToolTip(QStringLiteral("Selecione uma tela para compartilhar com o canal."));
     keyframeButton_ = new QPushButton(QStringLiteral("Pedir keyframe"));
     keyframeButton_->setToolTip(QStringLiteral("Solicita um keyframe ao participante selecionado."));
+    restartAudioButton_ = new QPushButton(QStringLiteral("Reiniciar áudio"));
+    restartAudioButton_->setToolTip(QStringLiteral("Recria a captura e a reprodução de áudio sem desconectar."));
     disconnectButton_ = new QPushButton(QStringLiteral("Desconectar"));
 
     localLevel_ = new QProgressBar;
@@ -227,6 +233,7 @@ QWidget* MainWindow::buildRoomPage() {
     toolbar->addWidget(micButton_);
     toolbar->addWidget(shareButton_);
     toolbar->addWidget(keyframeButton_);
+    toolbar->addWidget(restartAudioButton_);
     toolbar->addSpacing(12);
     toolbar->addWidget(new QLabel(QStringLiteral("Nível")));
     toolbar->addWidget(localLevel_);
@@ -268,11 +275,11 @@ QWidget* MainWindow::buildRoomPage() {
     usersLayout->setContentsMargins(0, 0, 0, 0);
     usersLayout->setSpacing(8);
     usersLayout->addWidget(MakeTitle(QStringLiteral("Participantes")));
-    userTable_ = new QTableWidget(0, 7);
+    userTable_ = new QTableWidget(0, 8);
     userTable_->setHorizontalHeaderLabels({QStringLiteral("Participante"), QStringLiteral("ID"),
                                            QStringLiteral("Canal"), QStringLiteral("Estado"),
                                            QStringLiteral("Nível"), QStringLiteral("Volume"),
-                                           QStringLiteral("Áudio")});
+                                           QStringLiteral("Tela"), QStringLiteral("Áudio")});
     userTable_->verticalHeader()->setVisible(false);
     userTable_->verticalHeader()->setDefaultSectionSize(34);
     userTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -285,6 +292,7 @@ QWidget* MainWindow::buildRoomPage() {
     userTable_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     userTable_->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
     userTable_->horizontalHeader()->setSectionResizeMode(6, QHeaderView::ResizeToContents);
+    userTable_->horizontalHeader()->setSectionResizeMode(7, QHeaderView::ResizeToContents);
     usersLayout->addWidget(userTable_, 1);
 
     auto* screenPanel = new QWidget;
@@ -358,6 +366,7 @@ QWidget* MainWindow::buildRoomPage() {
     connect(micButton_, &QPushButton::toggled, this, &MainWindow::toggleMicrophone);
     connect(shareButton_, &QPushButton::toggled, this, &MainWindow::toggleSharing);
     connect(keyframeButton_, &QPushButton::clicked, this, &MainWindow::requestKeyframeFromSelection);
+    connect(restartAudioButton_, &QPushButton::clicked, this, &MainWindow::restartAudio);
     connect(disconnectButton_, &QPushButton::clicked, this, &MainWindow::disconnectFromServer);
     return page;
 }
@@ -418,6 +427,7 @@ void MainWindow::onConnectionStateChanged() {
     switch (state) {
     case ConnectionState::Disconnected:
         connectStatus_->setText(QStringLiteral("Desconectado."));
+        if (restartAudioButton_) restartAudioButton_->setEnabled(false);
         if (inRoom_ && controller_->isRunning()) {
             appendLog(QStringLiteral("Desconectado do servidor."));
             disconnectFromServer();
@@ -428,6 +438,7 @@ void MainWindow::onConnectionStateChanged() {
         break;
     case ConnectionState::Connected:
         connectStatus_->setText(QStringLiteral("Conectado."));
+        if (restartAudioButton_) restartAudioButton_->setEnabled(true);
         if (!inRoom_) {
             showRoomPage();
             appendLog(QStringLiteral("Conectado ao servidor."));
@@ -556,12 +567,21 @@ void MainWindow::toggleSharing(const bool sharing) {
         resolution->addItem(QStringLiteral("640 px — economia de dados"), 640);
         resolution->addItem(QStringLiteral("960 px — recomendada"), 960);
         resolution->addItem(QStringLiteral("1280 px — alta definição"), 1280);
+        resolution->addItem(QStringLiteral("1920 px — 1080p"), 1920);
+        resolution->addItem(QStringLiteral("Nativa — resolução do monitor"), 0);
         resolution->setCurrentIndex(resolution->findData(shareMaxWidth_));
+        auto* bitrate = new QComboBox(&settings);
+        bitrate->addItem(QStringLiteral("4 Mbps — internet"), 4);
+        bitrate->addItem(QStringLiteral("8 Mbps — recomendada (LAN)"), 8);
+        bitrate->addItem(QStringLiteral("12 Mbps — alta qualidade"), 12);
+        bitrate->addItem(QStringLiteral("20 Mbps — rede local rápida"), 20);
+        bitrate->setCurrentIndex(bitrate->findData(shareBitrateMbps_));
         auto* systemAudio = new QCheckBox(QStringLiteral("Compartilhar o som do computador"), &settings);
         systemAudio->setChecked(shareSystemAudio_);
         form->addRow(QStringLiteral("Fluidez:"), fps);
         form->addRow(QStringLiteral("Qualidade:"), quality);
         form->addRow(QStringLiteral("Resolução máxima:"), resolution);
+        form->addRow(QStringLiteral("Banda do vídeo:"), bitrate);
         form->addRow(QString(), systemAudio);
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &settings);
         form->addRow(buttons);
@@ -575,7 +595,11 @@ void MainWindow::toggleSharing(const bool sharing) {
         shareFps_ = fps->currentData().toInt();
         shareJpegQuality_ = quality->currentData().toInt();
         shareMaxWidth_ = resolution->currentData().toInt();
+        shareBitrateMbps_ = bitrate->currentData().toInt();
         shareSystemAudio_ = systemAudio->isChecked();
+        controller_->setVideoBitrate(shareBitrateMbps_ * 1000000.0);
+        shareEncodeScale_ = 1.0;
+        shareFrameBytes_ = 0;
 
         const auto screens = QGuiApplication::screens();
         if (screens.empty()) {
@@ -625,6 +649,7 @@ void MainWindow::toggleSharing(const bool sharing) {
         }
         sharedScreen_ = screen;
         sharing_ = true;
+        forceKeyframe_ = true;
         shareTimer_->start(1000 / shareFps_);
         appendLog(QStringLiteral("Compartilhando tela em %1×%2.")
                       .arg(size.width())
@@ -636,6 +661,7 @@ void MainWindow::toggleSharing(const bool sharing) {
         controller_->setSystemAudioEnabled(false, ignored);
         controller_->setSharing(false, 0, 0);
         sharing_ = false;
+        forceKeyframe_ = false;
         appendLog(QStringLiteral("Compartilhamento encerrado."));
     }
 }
@@ -644,13 +670,62 @@ void MainWindow::captureScreenFrame() {
     if (!sharing_ || !sharedScreen_ || !controller_->isRunning()) return;
     QImage image = sharedScreen_->grabWindow(0).toImage();
     if (image.isNull()) return;
-    if (image.width() > shareMaxWidth_) image = image.scaledToWidth(shareMaxWidth_, Qt::SmoothTransformation);
+    if (shareMaxWidth_ > 0 && image.width() > shareMaxWidth_) {
+        image = image.scaledToWidth(shareMaxWidth_, Qt::SmoothTransformation);
+    }
+
+    const auto fps = shareFps_ > 0 ? shareFps_ : 10;
+    const bool keyframe = forceKeyframe_;
+    const auto bitrate = (std::max)(500000.0, shareBitrateMbps_ * 1000000.0);
+    // The budget follows the configured bitrate exactly (plus a tiny margin)
+    // so the pacer never has more data queued than it can actually send. A
+    // global floor used to allow 64 KB frames against a 4 Mbps channel, which
+    // made the sender drop two thirds of the frames.
+    const auto budget = static_cast<std::size_t>(bitrate / 8.0 / fps * (keyframe ? 2.0 : 1.05));
+    const auto frameLimit = (std::min)((std::max)(budget, static_cast<std::size_t>(12 * 1024)),
+                                       vibez::protocol::kMaxVideoFrameBytes);
+
     QByteArray jpeg;
-    QBuffer buffer(&jpeg);
-    buffer.open(QIODevice::WriteOnly);
-    if (!image.save(&buffer, "JPG", shareJpegQuality_) ||
-        jpeg.size() > static_cast<qsizetype>(vibez::protocol::kMaxVideoFrameBytes) ||
-        !controller_->sendScreenFrame(jpeg)) return;
+    int quality = shareJpegQuality_;
+    double scale = std::clamp(shareEncodeScale_, 0.30, 1.0);
+    // Recover detail when the previous frame had plenty of room to grow.
+    if (shareFrameBytes_ > 0 && shareFrameBytes_ < static_cast<qsizetype>(frameLimit * 2 / 3)) {
+        scale = (std::min)(1.0, scale * 1.08);
+    }
+
+    qsizetype previousSize = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        QImage candidate = image;
+        if (scale < 0.999) {
+            candidate = image.scaled((std::max)(1, static_cast<int>(image.width() * scale)),
+                                     (std::max)(1, static_cast<int>(image.height() * scale)),
+                                     Qt::KeepAspectRatio,
+                                     attempt == 0 ? Qt::SmoothTransformation : Qt::FastTransformation);
+        }
+        QByteArray encoded;
+        QBuffer buffer(&encoded);
+        buffer.open(QIODevice::WriteOnly);
+        if (!candidate.save(&buffer, "JPG", quality)) return;
+        jpeg = std::move(encoded);
+        if (jpeg.size() <= static_cast<qsizetype>(frameLimit)) break;
+        // Stop early instead of burning the frame interval when we are not
+        // making progress.
+        if (attempt > 0 && jpeg.size() >= previousSize) break;
+        previousSize = jpeg.size();
+        // Spend quality first, then resolution; the screen stays readable while
+        // the bitrate stays bounded.
+        const double ratio = static_cast<double>(frameLimit) / static_cast<double>(jpeg.size());
+        if (quality > 35 && ratio > 0.7) {
+            quality = (std::max)(35, quality - 10);
+        } else {
+            scale = std::clamp(scale * std::sqrt((std::max)(0.20, ratio)), 0.30, 1.0);
+        }
+    }
+    shareEncodeScale_ = scale;
+    if (jpeg.isEmpty() || jpeg.size() > static_cast<qsizetype>(frameLimit)) return;
+    shareFrameBytes_ = jpeg.size();
+
+    if (controller_->sendScreenFrame(jpeg, keyframe)) forceKeyframe_ = false;
 }
 
 void MainWindow::onVideoFrameReceived(const quint32 senderId, const QByteArray& jpeg) {
@@ -677,6 +752,20 @@ void MainWindow::requestKeyframeFromSelection() {
     } else {
         appendLog(QStringLiteral("Keyframe solicitado a #%1.").arg(userId));
     }
+}
+
+void MainWindow::restartAudio() {
+    if (!controller_->isRunning()) {
+        appendLog(QStringLiteral("Conecte-se antes de reiniciar o áudio."));
+        return;
+    }
+    QString error;
+    if (controller_->restartAudio(error)) {
+        appendLog(QStringLiteral("Áudio reiniciado."));
+    } else {
+        appendLog(QStringLiteral("Falha ao reiniciar o áudio: ") + error);
+    }
+    updateAudioLabel();
 }
 
 void MainWindow::rebuildUserTable() {
@@ -719,6 +808,18 @@ void MainWindow::rebuildUserTable() {
         volumeLayout->addWidget(widgets.volume);
         userTable_->setCellWidget(row, 5, volumeHolder);
 
+        widgets.screenVolume = new QSlider(Qt::Horizontal);
+        widgets.screenVolume->setRange(0, 150);
+        widgets.screenVolume->setValue(userScreenVolumes_.value(user.id, 100));
+        widgets.screenVolume->setEnabled(user.sharing);
+        widgets.screenVolume->setToolTip(QStringLiteral("Volume do som da tela de %1: %2%")
+                                             .arg(QString::fromStdString(user.name)).arg(widgets.screenVolume->value()));
+        auto* screenVolumeHolder = new QWidget;
+        auto* screenVolumeLayout = new QHBoxLayout(screenVolumeHolder);
+        screenVolumeLayout->setContentsMargins(6, 6, 6, 6);
+        screenVolumeLayout->addWidget(widgets.screenVolume);
+        userTable_->setCellWidget(row, 6, screenVolumeHolder);
+
         widgets.mute = new QPushButton(QStringLiteral("Silenciar"));
         widgets.mute->setCheckable(true);
         widgets.mute->setChecked(userPlaybackMuted_.contains(user.id));
@@ -727,7 +828,7 @@ void MainWindow::rebuildUserTable() {
         auto* muteLayout = new QHBoxLayout(muteHolder);
         muteLayout->setContentsMargins(6, 4, 6, 4);
         muteLayout->addWidget(widgets.mute);
-        userTable_->setCellWidget(row, 6, muteHolder);
+        userTable_->setCellWidget(row, 7, muteHolder);
 
         const quint32 userId = user.id;
         QSlider* slider = widgets.volume;
@@ -735,6 +836,12 @@ void MainWindow::rebuildUserTable() {
             userVolumes_.insert(userId, value);
             controller_->setUserVolume(userId, static_cast<float>(value) / 100.0F);
             slider->setToolTip(QStringLiteral("Volume: %1%").arg(value));
+        });
+        QSlider* screenSlider = widgets.screenVolume;
+        connect(screenSlider, &QSlider::valueChanged, this, [this, userId, screenSlider](const int value) {
+            userScreenVolumes_.insert(userId, value);
+            controller_->setUserScreenVolume(userId, static_cast<float>(value) / 100.0F);
+            screenSlider->setToolTip(QStringLiteral("Volume da tela: %1%").arg(value));
         });
         QPushButton* mute = widgets.mute;
         connect(mute, &QPushButton::toggled, this, [this, userId, mute](const bool muted) {
@@ -788,6 +895,17 @@ void MainWindow::updateUserRows() {
         }
         widgets.status->setText(status);
         widgets.status->setForeground(QBrush(color));
+
+        // The screen-audio slider only makes sense while this participant is
+        // actually sharing their computer sound.
+        const bool canControlScreen = user.sharing && user.id != controller_->sessionId();
+        widgets.screenVolume->setEnabled(canControlScreen);
+        widgets.screenVolume->setToolTip(canControlScreen
+            ? QStringLiteral("Volume do som da tela de %1: %2%")
+                  .arg(QString::fromStdString(user.name))
+                  .arg(widgets.screenVolume->value())
+            : QStringLiteral("Disponível quando %1 compartilhar o som da tela.")
+                  .arg(QString::fromStdString(user.name)));
     }
 
     if (controller_->sessionId() != 0) {
@@ -823,10 +941,16 @@ void MainWindow::updateAudioLabel() {
         const QString text = QStringLiteral("Áudio: ativo (48 kHz mono, Opus)");
         audioLabel_->setText(text);
         connectAudio_->setText(text);
+        lastAudioError_.clear();
     } else {
-        const QString text = QStringLiteral("Áudio indisponível: ") + controller_->audioError();
+        const QString error = controller_->audioError();
+        const QString text = QStringLiteral("Áudio indisponível: ") + error;
         audioLabel_->setText(text);
         connectAudio_->setText(text);
+        if (!error.isEmpty() && error != lastAudioError_) {
+            lastAudioError_ = error;
+            appendLog(QStringLiteral("Áudio indisponível: ") + error);
+        }
     }
 }
 
@@ -855,6 +979,7 @@ void MainWindow::showConnectPage() {
     }
     if (shareTimer_) shareTimer_->stop();
     sharedScreen_ = nullptr;
+    forceKeyframe_ = false;
 }
 
 void MainWindow::showRoomPage() {
@@ -865,6 +990,7 @@ void MainWindow::showRoomPage() {
 void MainWindow::clearRoom() {
     if (shareTimer_) shareTimer_->stop();
     sharedScreen_ = nullptr;
+    forceKeyframe_ = false;
     channelList_->clear();
     userTable_->setRowCount(0);
     userRows_.clear();

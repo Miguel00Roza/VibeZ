@@ -28,6 +28,7 @@ bool SessionController::start(const QString& host, const quint16 port, const QSt
         return false;
     }
 
+    session->SetVideoBitrate(videoBitrateBps_);
     session->SetVideoFrameCallback([this](const vibez::client::VideoFrame& frame) {
         emit videoFrameReceived(frame.sessionId,
                                 QByteArray(reinterpret_cast<const char*>(frame.jpeg.data()),
@@ -95,11 +96,17 @@ bool SessionController::setSystemAudioEnabled(const bool enabled, QString& error
 
 bool SessionController::systemAudioEnabled() const { return session_ && session_->SystemAudioEnabled(); }
 
-bool SessionController::sendScreenFrame(const QByteArray& jpeg) {
+bool SessionController::sendScreenFrame(const QByteArray& jpeg, const bool keyframe) {
     if (!session_ || jpeg.isEmpty()) return false;
     return session_->SendVideoFrame(
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(jpeg.constData()),
-                                      static_cast<std::size_t>(jpeg.size())));
+                                      static_cast<std::size_t>(jpeg.size())),
+        keyframe);
+}
+
+void SessionController::setVideoBitrate(const double bitrateBps) {
+    videoBitrateBps_ = bitrateBps;
+    if (session_) session_->SetVideoBitrate(bitrateBps);
 }
 
 bool SessionController::requestKeyframe(const quint32 targetId) {
@@ -118,6 +125,22 @@ void SessionController::setUserMuted(const quint32 userId, const bool muted) {
     if (session_) session_->SetUserMuted(userId, muted);
 }
 
+void SessionController::setUserScreenVolume(const quint32 userId, const float volume) {
+    if (session_) session_->SetUserScreenVolume(userId, volume);
+}
+
+bool SessionController::restartAudio(QString& error) {
+    if (!session_) {
+        error = QStringLiteral("Sessão não iniciada");
+        return false;
+    }
+    std::string nativeError;
+    const bool result = session_->RestartAudio(nativeError);
+    error = QString::fromStdString(nativeError);
+    emit audioStateChanged();
+    return result;
+}
+
 vibez::client::ConnectionState SessionController::state() const {
     return session_ ? session_->State() : vibez::client::ConnectionState::Disconnected;
 }
@@ -131,7 +154,9 @@ QString SessionController::audioError() const {
 }
 float SessionController::localLevel() const { return session_ ? session_->LocalLevel() : 0.0F; }
 float SessionController::userLevel(const quint32 userId) const { return session_ ? session_->UserLevel(userId) : 0.0F; }
+float SessionController::userScreenLevel(const quint32 userId) const { return session_ ? session_->UserScreenLevel(userId) : 0.0F; }
 quint64 SessionController::receivedPackets() const { return session_ ? session_->ReceivedPackets() : 0; }
+quint64 SessionController::receivedSystemPackets() const { return session_ ? session_->ReceivedSystemPackets() : 0; }
 
 void SessionController::pollEvents() {
     if (!session_) return;

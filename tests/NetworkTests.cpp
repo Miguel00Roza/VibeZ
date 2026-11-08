@@ -119,9 +119,16 @@ int main() {
     NetworkClient bob;
     std::mutex packetMutex;
     std::optional<MediaPacket> receivedAudio;
+    std::optional<MediaPacket> receivedSystemAudio;
+    std::vector<MediaPacket> receivedVideo;
     bob.SetAudioSink([&](const MediaPacket& packet) {
         std::lock_guard lock(packetMutex);
-        receivedAudio = packet;
+        if ((packet.flags & vibez::protocol::kMediaFlagSystemAudio) != 0) receivedSystemAudio = packet;
+        else receivedAudio = packet;
+    });
+    bob.SetVideoSink([&](const MediaPacket& packet) {
+        std::lock_guard lock(packetMutex);
+        receivedVideo.push_back(packet);
     });
     CHECK(bob.Start(ConfigFor(port, "Bob"), error));
     const auto bobHello = WaitFor(bob, [](const NetworkEvent& event) {
@@ -208,6 +215,59 @@ int main() {
                 return event.type == NetworkEvent::Type::KeyframeRequest && event.sessionId == bobId;
             }, 3000);
             CHECK_MSG(keyframe.has_value(), "Keyframe request was not forwarded to the sharing client");
+
+            // Phase 6b: shared computer sound is flagged and relayed only while
+            // Alice is sharing; video fragments are relayed as well.
+            const std::vector<std::uint8_t> systemPayload{9, 8, 7, 6};
+            CHECK(alice.SendAudio(8, 2000, systemPayload, true));
+            const auto systemDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+            bool systemArrived = false;
+            while (std::chrono::steady_clock::now() < systemDeadline) {
+                {
+                    std::lock_guard lock(packetMutex);
+                    systemArrived = receivedSystemAudio.has_value();
+                }
+                if (systemArrived) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            CHECK_MSG(systemArrived, "Relayed shared-screen audio did not arrive at Bob");
+            {
+                std::lock_guard lock(packetMutex);
+                if (receivedSystemAudio) {
+                    CHECK((receivedSystemAudio->flags & vibez::protocol::kMediaFlagSystemAudio) != 0);
+                    CHECK(receivedSystemAudio->sequence == 8);
+                    CHECK(receivedSystemAudio->payload == systemPayload);
+                }
+            }
+
+            const std::vector<std::uint8_t> firstFragment{10, 20, 30};
+            const std::vector<std::uint8_t> secondFragment{40, 50};
+            CHECK(alice.SendVideo(9, 3000, vibez::protocol::kMediaFlagKeyframe, 77, 0, 2, firstFragment));
+            CHECK(alice.SendVideo(10, 3000, 0, 77, 1, 2, secondFragment));
+            const auto videoDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+            bool videoArrived = false;
+            while (std::chrono::steady_clock::now() < videoDeadline) {
+                {
+                    std::lock_guard lock(packetMutex);
+                    videoArrived = receivedVideo.size() >= 2;
+                }
+                if (videoArrived) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            CHECK_MSG(videoArrived, "Relayed video fragments did not arrive at Bob");
+            {
+                std::lock_guard lock(packetMutex);
+                CHECK(!receivedVideo.empty());
+                if (receivedVideo.size() >= 2) {
+                    CHECK(receivedVideo[0].type == vibez::protocol::MediaType::Video);
+                    CHECK(receivedVideo[0].sessionId == aliceId);
+                    CHECK(receivedVideo[0].frameId == 77);
+                    CHECK(receivedVideo[0].fragmentIndex == 0 && receivedVideo[0].fragmentCount == 2);
+                    CHECK(receivedVideo[0].payload == firstFragment);
+                    CHECK(receivedVideo[1].fragmentIndex == 1);
+                    CHECK(receivedVideo[1].payload == secondFragment);
+                }
+            }
 
             // Phase 7: chat is delivered only through the server to the current channel.
             CHECK(alice.SendChat("Hello from Alice"));

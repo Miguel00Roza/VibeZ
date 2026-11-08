@@ -13,7 +13,8 @@ namespace vibez::audio {
 
 class VoiceEncoder {
 public:
-    VoiceEncoder();
+    // music enables the music tuning for the shared computer sound stream.
+    explicit VoiceEncoder(int bitrate = 24000, bool music = false);
     ~VoiceEncoder();
     VoiceEncoder(const VoiceEncoder&) = delete;
     VoiceEncoder& operator=(const VoiceEncoder&) = delete;

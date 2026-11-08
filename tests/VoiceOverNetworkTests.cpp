@@ -106,13 +106,16 @@ int main() {
     vibez::audio::VoiceDecoder decoder;
     vibez::audio::AudioMixer mixer;
     std::atomic<int> received{};
+    std::atomic<int> receivedSystem{};
     std::mutex decodeMutex;
     bob.SetAudioSink([&](const MediaPacket& packet) {
         if (packet.type != vibez::protocol::MediaType::Audio) return;
         std::lock_guard lock(decodeMutex);
         const auto pcm = decoder.Decode(packet.payload);
-        mixer.PushSamples(packet.sessionId, pcm);
+        const bool systemAudio = (packet.flags & vibez::protocol::kMediaFlagSystemAudio) != 0;
+        mixer.PushSamples(packet.sessionId, systemAudio, pcm);
         received.fetch_add(1);
+        if (systemAudio) receivedSystem.fetch_add(1);
     });
 
     if (aliceId != 0 && bobId != 0) {
@@ -139,6 +142,38 @@ int main() {
         const auto rms = vibez::audio::RmsLevel(mixed);
         CHECK_MSG(rms > 0.02F, "Decoded voice frame is silent");
         CHECK(mixer.PeakLevel(aliceId) > 0.02F);
+
+        // Shared computer sound travels as a separate flagged stream so the
+        // receiver keeps independent voice and screen-audio levels.
+        vibez::protocol::Writer sharingPayload;
+        sharingPayload.U8(1);
+        sharingPayload.U16(640);
+        sharingPayload.U16(480);
+        CHECK(alice.SendControl(ControlType::SetSharing, sharingPayload.Data()));
+        CHECK(WaitFor(bob, [&](const NetworkEvent& event) {
+            if (event.type != NetworkEvent::Type::PresenceUpdated) return false;
+            for (const auto& user : event.users) {
+                if (user.id == aliceId && user.sharing) return true;
+            }
+            return false;
+        }, 3000).has_value());
+
+        vibez::audio::VoiceEncoder musicEncoder(64000, true);
+        const auto encodedSystem = musicEncoder.Encode(tone);
+        CHECK(!encodedSystem.empty());
+        const int systemBefore = receivedSystem.load();
+        CHECK(alice.SendAudio(2, 1100, encodedSystem, true));
+        const auto systemDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < systemDeadline && receivedSystem.load() == systemBefore) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK_MSG(receivedSystem.load() > systemBefore, "Shared-screen audio did not reach Bob");
+        {
+            std::lock_guard lock(decodeMutex);
+            mixer.Mix(mixed);
+        }
+        CHECK_MSG(mixer.PeakLevel(aliceId, true) > 0.02F, "Decoded screen audio is silent");
+        CHECK(mixer.PeakLevel(aliceId) == 0.0F);
 
         // Channel isolation: move Bob elsewhere and verify audio stops.
         vibez::protocol::Writer createPayload;

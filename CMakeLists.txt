@@ -33,7 +33,7 @@ add_library(vibez_audio
     client/audio/VoiceEngine.cpp
 )
 target_include_directories(vibez_audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vibez_audio PUBLIC Opus::opus ole32 uuid mmdevapi propsys)
+target_link_libraries(vibez_audio PUBLIC Opus::opus ole32 uuid mmdevapi propsys avrt)
 target_compile_options(vibez_audio PRIVATE /W4 /permissive- /Zc:__cplusplus)
 
 add_library(vibez_net
@@ -65,6 +65,11 @@ target_compile_options(vibez_ui PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
 
 add_library(vibez_server_lib
     server/src/Server.cpp
+    server/src/ScreenStream.cpp
+    server/src/ScreenStream.hpp
+    server/src/WebServer.cpp
+    server/src/WebServer.hpp
+    server/src/WebPage.hpp
 )
 target_include_directories(vibez_server_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(vibez_server_lib PUBLIC vibez_protocol ws2_32 iphlpapi)
@@ -91,27 +96,29 @@ function(copy_opus_runtime target)
         VERBATIM)
 endfunction()
 
-# windeployqt copies the Qt DLLs and platform plugins beside the GUI binary so
-# it can start from the build tree and from a copied folder.
+# Copies the Qt plugins (platform, image formats, styles) beside the GUI
+# binary. vcpkg's windeployqt locates the release prefix even in a Debug build
+# and fails to find the debug Qt DLLs, so copy the plugin trees explicitly.
 function(deploy_qt_runtime target)
     if(NOT WIN32)
         return()
     endif()
-    if(TARGET Qt6::qmake)
-        get_target_property(_vibez_qmake Qt6::qmake IMPORTED_LOCATION)
-    endif()
-    find_program(VIBEZ_WINDEPLOYQT NAMES windeployqt
-        HINTS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/tools/Qt6/bin"
-        DOC "Qt deployment tool")
-    if(NOT VIBEZ_WINDEPLOYQT)
-        message(WARNING "windeployqt not found; add the Qt bin directory to PATH to run the GUI")
+    set(_debug_plugins "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/debug/Qt6/plugins")
+    set(_release_plugins "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/Qt6/plugins")
+    if(EXISTS "${_debug_plugins}" AND EXISTS "${_release_plugins}")
+        set(_plugins "$<IF:$<CONFIG:Debug>,${_debug_plugins},${_release_plugins}>")
+    elseif(EXISTS "${_debug_plugins}")
+        set(_plugins "${_debug_plugins}")
+    elseif(EXISTS "${_release_plugins}")
+        set(_plugins "${_release_plugins}")
+    else()
+        message(WARNING "Qt plugins not found; add the Qt plugin directory to the vcpkg install")
         return()
     endif()
     add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND "${VIBEZ_WINDEPLOYQT}" --no-translations
-            "$<IF:$<CONFIG:Debug>,--debug,--release>"
-            --dir "$<TARGET_FILE_DIR:${target}>" "$<TARGET_FILE:${target}>"
-        COMMENT "Deploying Qt runtime for ${target}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_plugins}" "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Deploying Qt plugins for ${target}"
         VERBATIM)
 endfunction()
 
@@ -119,10 +126,13 @@ copy_opus_runtime(VibeZConsole)
 copy_opus_runtime(VibeZClient)
 
 # Qt's imported targets expose their runtime DLLs to CMake.  Copying this
-# closure complements windeployqt (which is responsible for plugins) and
-# includes libraries such as zlib, FreeType and ICU from vcpkg.
+# closure complements the plugin deployment above and includes libraries such
+# as zlib, FreeType and ICU from vcpkg.  Both the release and the debug bin
+# directories are copied because debug Qt DLLs depend on the "d"-suffixed
+# third-party libraries (libpng16d, freetyped, zd, pcre2-16d, ...).
 file(GLOB VIBEZ_VCPKG_RUNTIME_DLLS
-    "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/bin/*.dll")
+    "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/bin/*.dll"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows/debug/bin/*.dll")
 add_custom_command(TARGET VibeZClient POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy -t "$<TARGET_FILE_DIR:VibeZClient>"
         $<TARGET_RUNTIME_DLLS:VibeZClient>
@@ -170,7 +180,12 @@ if(BUILD_TESTING)
     copy_opus_runtime(vibez_voice_network_tests)
     add_test(NAME vibez_voice_network_tests COMMAND vibez_voice_network_tests)
 
-    set_tests_properties(vibez_protocol_tests vibez_audio_tests vibez_server_integration_tests vibez_network_tests vibez_voice_network_tests PROPERTIES TIMEOUT 60)
+    add_executable(vibez_web_tests tests/WebTests.cpp)
+    target_link_libraries(vibez_web_tests PRIVATE vibez_server_lib)
+    target_compile_options(vibez_web_tests PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    add_test(NAME vibez_web_tests COMMAND vibez_web_tests)
+
+    set_tests_properties(vibez_protocol_tests vibez_audio_tests vibez_server_integration_tests vibez_network_tests vibez_voice_network_tests vibez_web_tests PROPERTIES TIMEOUT 60)
 endif()
 
 install(TARGETS VibeZClient VibeZConsole VibeZServer RUNTIME DESTINATION .)

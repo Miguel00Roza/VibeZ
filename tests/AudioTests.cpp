@@ -56,6 +56,15 @@ int main() {
     CHECK(!blocking.TryPush(8));
     CHECK(!blocking.WaitPop(value, std::chrono::milliseconds(10)));
 
+    // The streaming queues drop the oldest sample/frame when full so live
+    // audio and paced video never block the producer.
+    BlockingQueue<int> dropping(2);
+    CHECK(dropping.TryPush(1));
+    CHECK(dropping.TryPush(2));
+    CHECK(dropping.TryPush(3));
+    CHECK(dropping.WaitPop(value, std::chrono::milliseconds(10)) && value == 2);
+    CHECK(dropping.WaitPop(value, std::chrono::milliseconds(10)) && value == 3);
+
     LinearResampler down;
     down.Configure(48000, 24000);
     std::vector<float> input(4800, 1.0F);
@@ -102,6 +111,29 @@ int main() {
     mixer.SetMasterVolume(0.0F);
     mixer.Mix(mixed);
     CHECK(mixed.front() == 0);
+
+    // Voice and shared-screen audio are independent streams: each has its own
+    // gain, mute state and peak level so the UI can control them separately.
+    AudioMixer separate;
+    separate.SetUserVolume(2, 0.5F);
+    separate.SetUserVolume(2, true, 1.0F);
+    separate.PushSamples(2, std::vector<std::int16_t>(960, 1000));
+    separate.PushSamples(2, true, std::vector<std::int16_t>(960, 2000));
+    separate.Mix(mixed);
+    CHECK(mixed.front() == 2500);
+    CHECK(separate.PeakLevel(2) > 0.0F);
+    CHECK(separate.PeakLevel(2, true) > 0.0F);
+    CHECK(separate.PeakLevel(3, true) == 0.0F);
+
+    separate.SetUserMuted(2, true); // Mutes only the microphone stream.
+    separate.PushSamples(2, true, std::vector<std::int16_t>(960, 2000));
+    separate.Mix(mixed);
+    CHECK(mixed.front() == 2000);
+    CHECK(separate.PeakLevel(2) == 0.0F);
+    CHECK(separate.PeakLevel(2, true) > 0.0F);
+
+    separate.RemoveUser(2);
+    CHECK(separate.PeakLevel(2, true) == 0.0F);
 
     return vibez::test::Finish("Audio tests");
 }

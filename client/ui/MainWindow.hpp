@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QMainWindow>
 #include <QSet>
+#include <QString>
 
 class SessionController;
 class QLabel;
@@ -28,6 +29,7 @@ struct UserRow {
     QTableWidgetItem* status{};
     QProgressBar* level{};
     QSlider* volume{};
+    QSlider* screenVolume{};
     QPushButton* mute{};
 };
 
@@ -63,6 +65,7 @@ private:
     void toggleMicrophone(bool active);
     void toggleSharing(bool sharing);
     void requestKeyframeFromSelection();
+    void restartAudio();
     void captureScreenFrame();
     void onVideoFrameReceived(quint32 senderId, const QByteArray& jpeg);
 
@@ -97,6 +100,7 @@ private:
     QPushButton* micButton_{};
     QPushButton* shareButton_{};
     QPushButton* keyframeButton_{};
+    QPushButton* restartAudioButton_{};
     QPushButton* disconnectButton_{};
     QLabel* screenViewerTitle_{};
     QLabel* screenViewer_{};
@@ -109,7 +113,9 @@ private:
 
     QHash<quint32, UserRow> userRows_;
     QHash<quint32, int> userVolumes_;
+    QHash<quint32, int> userScreenVolumes_;
     QSet<quint32> userPlaybackMuted_;
+    QString lastAudioError_;
     quint32 autoJoinChannel_{};
     bool inRoom_{};
     bool muted_{};
@@ -117,7 +123,11 @@ private:
     int shareFps_{10};
     int shareJpegQuality_{55};
     int shareMaxWidth_{960};
+    int shareBitrateMbps_{8};
+    double shareEncodeScale_{1.0};
+    qsizetype shareFrameBytes_{};
     bool shareSystemAudio_{true};
+    bool forceKeyframe_{};
     QScreen* sharedScreen_{};
     QTimer* shareTimer_{};
 };

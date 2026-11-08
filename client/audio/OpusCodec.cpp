@@ -11,13 +11,13 @@ void Check(const int result, const char* operation) {
 }
 }
 
-VoiceEncoder::VoiceEncoder() {
+VoiceEncoder::VoiceEncoder(const int bitrate, const bool music) {
     int error{};
     encoder_ = opus_encoder_create(kSampleRate, kChannels, OPUS_APPLICATION_VOIP, &error);
     Check(error, "opus_encoder_create");
-    Check(opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(24000)), "OPUS_SET_BITRATE");
+    Check(opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate)), "OPUS_SET_BITRATE");
     Check(opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(5)), "OPUS_SET_COMPLEXITY");
-    Check(opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)), "OPUS_SET_SIGNAL");
+    Check(opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(music ? OPUS_SIGNAL_MUSIC : OPUS_SIGNAL_VOICE)), "OPUS_SET_SIGNAL");
 }
 VoiceEncoder::~VoiceEncoder() { if (encoder_) opus_encoder_destroy(encoder_); }
 
