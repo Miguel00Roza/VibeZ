@@ -1,6 +1,7 @@
 #include "server/include/vibez/server/Server.hpp"
 #include "common/protocol/Protocol.hpp"
 #include "server/src/ScreenStream.hpp"
+#include "server/src/SystemAudio.hpp"
 #include "server/src/WebServer.hpp"
 
 #include <winsock2.h>
@@ -94,6 +95,7 @@ struct Server::Impl {
     std::uint32_t nextSessionId{1};
     std::uint32_t nextChannelId{2};
     std::shared_ptr<ScreenStreamHub> hub{std::make_shared<ScreenStreamHub>()};
+    std::shared_ptr<SystemAudioHub> audioHub{std::make_shared<SystemAudioHub>()};
     std::unique_ptr<WebServer> web;
 
     void CloseSession(const SOCKET socket) {
@@ -161,6 +163,7 @@ struct Server::Impl {
                             session.sharing, session.shareWidth, session.shareHeight});
         }
         hub->SyncSessions(list);
+        audioHub->SyncSessions(list);
     }
 
     void BroadcastChannel(const std::uint32_t channelId, const ControlType type,
@@ -277,7 +280,7 @@ struct Server::Impl {
     }
 
     void RelayMedia() {
-        std::array<std::uint8_t, protocol::kMaxMediaPayload + 32> buffer{};
+        std::array<std::uint8_t, protocol::kMaxMediaDatagram> buffer{};
         struct PendingVideo {
             std::vector<std::uint8_t> packet;
             std::uint32_t channel{};
@@ -296,7 +299,13 @@ struct Server::Impl {
             int senderSize = sizeof(sender);
             const int received = recvfrom(udpSocket, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0,
                                           reinterpret_cast<sockaddr*>(&sender), &senderSize);
-            if (received <= 0) break;
+            if (received == SOCKET_ERROR) {
+                // Winsock discards a datagram that does not fit the buffer.
+                // Keep draining instead of stalling the whole relay loop.
+                if (WSAGetLastError() == WSAEMSGSIZE) continue;
+                break;
+            }
+            if (received == 0) break;
             const auto packet = std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received));
             const auto header = protocol::DecodeMediaHeader(packet);
             if (!header) continue;
@@ -329,6 +338,9 @@ struct Server::Impl {
             const bool systemAudio = (header->flags & protocol::kMediaFlagSystemAudio) != 0;
             if (systemAudio) {
                 if (!source->second.sharing) continue;
+                // Decode once in the hub so every browser listener shares the
+                // same PCM buffer and packet-loss handling.
+                if (web) audioHub->PushPacket(*header, packet.subspan(protocol::kMediaHeaderSize));
             } else if (source->second.muted) {
                 continue;
             }
@@ -360,6 +372,8 @@ bool Server::Run() {
         // The viewer threads read frames from the hub, so stop them before the
         // sockets (and then WSA) are torn down.
         if (impl_->web) { impl_->web->Stop(); impl_->web.reset(); }
+        impl_->hub->Clear();
+        impl_->audioHub->Clear();
         webPort_.store(0);
         for (const auto& [socket, session] : impl_->sessions) closesocket(socket);
         impl_->sessions.clear();
@@ -385,7 +399,7 @@ bool Server::Run() {
     }
     std::cout << std::flush;
     if (webEnabled_) {
-        impl_->web = std::make_unique<WebServer>(impl_->hub);
+        impl_->web = std::make_unique<WebServer>(impl_->hub, impl_->audioHub);
         WebServerConfig config;
         config.port = webConfig_.port;
         config.bindAddress = webConfig_.bindAddress;

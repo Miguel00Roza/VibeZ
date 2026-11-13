@@ -67,15 +67,26 @@ add_library(vibez_server_lib
     server/src/Server.cpp
     server/src/ScreenStream.cpp
     server/src/ScreenStream.hpp
+    server/src/SystemAudio.cpp
+    server/src/SystemAudio.hpp
     server/src/WebServer.cpp
     server/src/WebServer.hpp
     server/src/WebPage.hpp
 )
 target_include_directories(vibez_server_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vibez_server_lib PUBLIC vibez_protocol ws2_32 iphlpapi)
+target_link_libraries(vibez_server_lib PUBLIC vibez_protocol ws2_32 iphlpapi PRIVATE Opus::opus)
 
-add_executable(VibeZServer server/src/main.cpp)
-target_link_libraries(VibeZServer PRIVATE vibez_server_lib)
+# Reading/writing vibez-server.ini. Kept out of the server library so the tests
+# can exercise it without opening sockets.
+add_library(vibez_server_config
+    server/src/ServerConfig.cpp
+    server/src/ServerConfig.hpp
+)
+target_include_directories(vibez_server_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(vibez_server_config PRIVATE /W4 /permissive- /Zc:__cplusplus)
+
+add_executable(VibeZServer server/src/main.cpp server/VibeZServer.rc)
+target_link_libraries(VibeZServer PRIVATE vibez_server_lib vibez_server_config)
 
 # The console client is kept for scripting and headless tests.
 add_executable(VibeZConsole client/src/main.cpp)
@@ -83,7 +94,7 @@ set_target_properties(VibeZConsole PROPERTIES OUTPUT_NAME "VibeZConsole")
 target_link_libraries(VibeZConsole PRIVATE vibez_client_core)
 
 # GUI client. VibeZ.exe is the user-facing application.
-add_executable(VibeZClient WIN32 client/ui/main.cpp)
+add_executable(VibeZClient WIN32 client/ui/main.cpp client/ui/VibeZ.rc)
 set_target_properties(VibeZClient PROPERTIES OUTPUT_NAME "VibeZ")
 target_link_libraries(VibeZClient PRIVATE vibez_ui)
 target_compile_options(VibeZClient PRIVATE /utf-8)
@@ -124,6 +135,7 @@ endfunction()
 
 copy_opus_runtime(VibeZConsole)
 copy_opus_runtime(VibeZClient)
+copy_opus_runtime(VibeZServer)
 
 # Qt's imported targets expose their runtime DLLs to CMake.  Copying this
 # closure complements the plugin deployment above and includes libraries such
@@ -167,11 +179,18 @@ if(BUILD_TESTING)
 
     add_executable(vibez_server_integration_tests tests/ServerIntegrationTests.cpp)
     target_link_libraries(vibez_server_integration_tests PRIVATE vibez_server_lib)
+    copy_opus_runtime(vibez_server_integration_tests)
     add_test(NAME vibez_server_integration_tests COMMAND vibez_server_integration_tests)
+
+    add_executable(vibez_server_config_tests tests/ServerConfigTests.cpp)
+    target_link_libraries(vibez_server_config_tests PRIVATE vibez_server_config)
+    target_compile_options(vibez_server_config_tests PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    add_test(NAME vibez_server_config_tests COMMAND vibez_server_config_tests)
 
     add_executable(vibez_network_tests tests/NetworkTests.cpp)
     target_link_libraries(vibez_network_tests PRIVATE vibez_net vibez_server_lib)
     target_compile_options(vibez_network_tests PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    copy_opus_runtime(vibez_network_tests)
     add_test(NAME vibez_network_tests COMMAND vibez_network_tests)
 
     add_executable(vibez_voice_network_tests tests/VoiceOverNetworkTests.cpp)
@@ -181,11 +200,12 @@ if(BUILD_TESTING)
     add_test(NAME vibez_voice_network_tests COMMAND vibez_voice_network_tests)
 
     add_executable(vibez_web_tests tests/WebTests.cpp)
-    target_link_libraries(vibez_web_tests PRIVATE vibez_server_lib)
+    target_link_libraries(vibez_web_tests PRIVATE vibez_server_lib Opus::opus)
     target_compile_options(vibez_web_tests PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    copy_opus_runtime(vibez_web_tests)
     add_test(NAME vibez_web_tests COMMAND vibez_web_tests)
 
-    set_tests_properties(vibez_protocol_tests vibez_audio_tests vibez_server_integration_tests vibez_network_tests vibez_voice_network_tests vibez_web_tests PROPERTIES TIMEOUT 60)
+    set_tests_properties(vibez_protocol_tests vibez_audio_tests vibez_server_integration_tests vibez_server_config_tests vibez_network_tests vibez_voice_network_tests vibez_web_tests PROPERTIES TIMEOUT 60)
 endif()
 
 install(TARGETS VibeZClient VibeZConsole VibeZServer RUNTIME DESTINATION .)

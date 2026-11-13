@@ -15,6 +15,10 @@ constexpr std::uint32_t kMediaMagic = 0x565A4D31;   // "VZM1"
 constexpr std::size_t kMaxControlPayload = 64 * 1024;
 constexpr std::size_t kMaxMediaPayload = 1200;
 constexpr std::size_t kMediaHeaderSize = 34;
+// Largest datagram that can carry a full media payload. Receive buffers must be
+// at least this big: Winsock drops a datagram (WSAEMSGSIZE) when the buffer is
+// smaller, which silently loses every full-size video fragment.
+constexpr std::size_t kMaxMediaDatagram = kMediaHeaderSize + kMaxMediaPayload;
 constexpr std::size_t kMaxVideoFrameBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxVideoFragments = 2048;
 constexpr std::uint8_t kMediaFlagKeyframe = 0x01;

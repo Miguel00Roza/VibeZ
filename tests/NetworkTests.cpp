@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <iostream>
@@ -267,6 +268,31 @@ int main() {
                     CHECK(receivedVideo[1].fragmentIndex == 1);
                     CHECK(receivedVideo[1].payload == secondFragment);
                 }
+            }
+
+            // A fragment with the maximum payload must fit the receive buffers
+            // end to end (header + 1200 bytes = 1234). A buffer that is a few
+            // bytes short makes Winsock drop every full fragment, so no frame
+            // ever completes and the remote screen stays blank.
+            const std::vector<std::uint8_t> fullFragment(vibez::protocol::kMaxMediaPayload, 0xA5);
+            CHECK(alice.SendVideo(11, 3000, 0, 78, 0, 1, fullFragment));
+            const auto fullDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+            bool fullArrived = false;
+            while (std::chrono::steady_clock::now() < fullDeadline) {
+                {
+                    std::lock_guard lock(packetMutex);
+                    fullArrived = std::any_of(receivedVideo.begin(), receivedVideo.end(),
+                                              [](const MediaPacket& packet) { return packet.frameId == 78; });
+                }
+                if (fullArrived) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            CHECK_MSG(fullArrived, "A maximum-size video fragment was dropped");
+            {
+                std::lock_guard lock(packetMutex);
+                const auto full = std::find_if(receivedVideo.begin(), receivedVideo.end(),
+                                               [](const MediaPacket& packet) { return packet.frameId == 78; });
+                if (full != receivedVideo.end()) CHECK(full->payload == fullFragment);
             }
 
             // Phase 7: chat is delivered only through the server to the current channel.

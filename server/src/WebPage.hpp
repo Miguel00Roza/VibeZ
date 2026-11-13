@@ -140,6 +140,17 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  #volume {
+    width: 110px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  #volume[hidden] { display: none; }
+  #sound.live {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  #sound.pending { animation: pulse 2s infinite; }
   @media (max-width: 640px) {
     header { padding: 8px 12px; gap: 8px; }
     .brand { font-size: 15px; }
@@ -148,6 +159,7 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
     footer { gap: 8px; }
     footer .meta { flex-basis: 100%; white-space: normal; }
     footer button, footer a.button { flex: 1 1 28%; }
+    #volume { flex: 1 1 100%; width: auto; }
   }
 </style>
 </head>
@@ -169,6 +181,8 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
 </main>
 <footer>
   <div class="meta" id="meta">—</div>
+  <button id="sound" type="button">Ativar som</button>
+  <input id="volume" type="range" min="0" max="100" step="1" value="80" aria-label="Volume do som compartilhado" hidden>
   <button id="fullscreen" type="button">Tela cheia</button>
   <a class="button" id="download" href="#" download="vibez-tela.jpg">Baixar imagem</a>
   <button id="reload" type="button">Recarregar</button>
@@ -189,6 +203,8 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
   const download = document.getElementById('download');
   const fullscreenButton = document.getElementById('fullscreen');
   const reloadButton = document.getElementById('reload');
+  const soundButton = document.getElementById('sound');
+  const volume = document.getElementById('volume');
 
   const state = {
     streams: [],
@@ -199,6 +215,189 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
     objectUrl: null,
     pickerSignature: '',
   };
+
+  // Shared-computer sound. Browsers only allow audio after a user gesture, so
+  // the stream starts on the "Ativar som" button (or the first tap when the
+  // preference was saved from a previous visit).
+  const audio = {
+    ctx: null,
+    gain: null,
+    on: false,
+    running: false,
+    runId: 0,
+    controller: null,
+    nextTime: 0,
+    carry: null,
+    sources: [],
+    selection: null,
+    lastBytesAt: 0,
+  };
+
+  try {
+    audio.on = window.localStorage.getItem('vibez-sound') === '1';
+    const savedVolume = Number(window.localStorage.getItem('vibez-volume'));
+    if (Number.isFinite(savedVolume) && savedVolume >= 0 && savedVolume <= 100) volume.value = String(savedVolume);
+  } catch (error) {
+    // Storage can be disabled; sound still works for this visit.
+  }
+
+  function updateSoundButton() {
+    soundButton.textContent = audio.running ? 'Som ligado' : 'Ativar som';
+    soundButton.classList.toggle('live', audio.running);
+    soundButton.classList.toggle('pending', audio.on && !audio.running);
+    volume.hidden = !audio.on;
+  }
+
+  async function ensureAudioContext() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return false;
+    if (!audio.ctx) {
+      audio.ctx = new Ctx({ latencyHint: 'interactive' });
+      audio.gain = audio.ctx.createGain();
+      audio.gain.gain.value = Number(volume.value) / 100;
+      audio.gain.connect(audio.ctx.destination);
+    }
+    try {
+      if (audio.ctx.state === 'suspended') await audio.ctx.resume();
+    } catch (error) {
+      return false;
+    }
+    return audio.ctx.state === 'running';
+  }
+
+  function stopAudio() {
+    audio.running = false;
+    ++audio.runId;
+    if (audio.controller) {
+      audio.controller.abort();
+      audio.controller = null;
+    }
+    audio.carry = null;
+    audio.nextTime = 0;
+    for (const source of audio.sources) {
+      try { source.stop(); } catch (error) { /* Already ended. */ }
+    }
+    audio.sources = [];
+    updateSoundButton();
+  }
+
+  function schedulePcm(samples) {
+    const ctx = audio.ctx;
+    if (!ctx || !samples.length) return;
+    if (!audio.nextTime || audio.nextTime < ctx.currentTime - 0.05) {
+      // A small prebuffer absorbs network jitter without adding audible delay.
+      audio.nextTime = ctx.currentTime + 0.18;
+    }
+    // If we ever run far ahead (clock drift), drop fresh data instead of
+    // stacking minutes of latency.
+    if (audio.nextTime - ctx.currentTime > 0.8) return;
+
+    const buffer = ctx.createBuffer(1, samples.length, 48000);
+    buffer.getChannelData(0).set(samples);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audio.gain);
+    source.start(audio.nextTime);
+    audio.nextTime += buffer.duration;
+    audio.sources.push(source);
+    source.onended = () => {
+      const index = audio.sources.indexOf(source);
+      if (index >= 0) audio.sources.splice(index, 1);
+    };
+  }
+
+  function feedPcm(chunk) {
+    let data = chunk;
+    if (audio.carry && audio.carry.length) {
+      const merged = new Uint8Array(audio.carry.length + data.length);
+      merged.set(audio.carry);
+      merged.set(data, audio.carry.length);
+      data = merged;
+    }
+    const count = Math.floor(data.length / 2);
+    if (count === 0) {
+      audio.carry = data;
+      return;
+    }
+    const view = new DataView(data.buffer, data.byteOffset, count * 2);
+    const samples = new Float32Array(count);
+    for (let index = 0; index < count; ++index) {
+      samples[index] = view.getInt16(index * 2, true) / 32768;
+    }
+    audio.carry = data.slice(count * 2);
+    schedulePcm(samples);
+  }
+
+  async function startAudio() {
+    if (!audio.on) return;
+    audio.selection = state.selection;
+    if (!(await ensureAudioContext())) {
+      audio.on = false;
+      audio.selection = null;
+      updateSoundButton();
+      return;
+    }
+    stopAudio();
+
+    const runId = ++audio.runId;
+    audio.running = true;
+    audio.carry = null;
+    audio.nextTime = 0;
+    const controller = new AbortController();
+    audio.controller = controller;
+    updateSoundButton();
+
+    const requestId = state.selection;
+    try {
+      const response = await fetch('/audio.pcm?session=' + requestId + '&t=' + Date.now(),
+                                   { cache: 'no-store', signal: controller.signal });
+      if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
+      const reader = response.body.getReader();
+      while (audio.running && audio.runId === runId) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          audio.lastBytesAt = performance.now();
+          feedPcm(value);
+        }
+      }
+    } catch (error) {
+      // The retry below runs while the user still wants sound.
+    }
+
+    if (audio.running && audio.runId === runId) {
+      // The server closes the stream when the share ends or the listener is
+      // slow. Reconnect shortly, and stop cleanly if nobody is sharing.
+      window.setTimeout(() => {
+        if (audio.running && audio.runId === runId) {
+          if (state.streams.length) startAudio();
+          else { stopAudio(); audio.selection = null; }
+        }
+      }, 1200);
+    }
+  }
+
+  soundButton.addEventListener('click', async () => {
+    if (!audio.on) {
+      audio.on = true;
+      try { window.localStorage.setItem('vibez-sound', '1'); } catch (error) { /* ignore */ }
+      updateSoundButton();
+      await startAudio();
+    } else if (!audio.running) {
+      await startAudio();
+    } else {
+      audio.on = false;
+      try { window.localStorage.setItem('vibez-sound', '0'); } catch (error) { /* ignore */ }
+      stopAudio();
+    }
+  });
+
+  volume.addEventListener('input', () => {
+    if (audio.gain) audio.gain.gain.value = Number(volume.value) / 100;
+    try { window.localStorage.setItem('vibez-volume', volume.value); } catch (error) { /* ignore */ }
+  });
+
+  updateSoundButton();
 
   function setStatus(label, live) {
     statusText.textContent = label;
@@ -296,20 +495,30 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
       updatePicker();
       const current = effectiveStream();
       if (!current) {
+        stopAudio();
+        audio.selection = null;
         setStatus('aguardando transmissão', false);
-        meta.textContent = data.viewers ? data.viewers + ' espectador(es) conectado(s)' : 'nenhum compartilhamento ativo';
+        const listeners = data.listeners ? ' · ' + data.listeners + ' ouvindo' : '';
+        meta.textContent = (data.viewers ? data.viewers + ' espectador(es) conectado(s)' : 'nenhum compartilhamento ativo') + listeners;
         if (state.requested !== -1) stopStream();
         showWaiting();
         return;
       }
       if (state.requested !== state.selection) startStream(state.selection);
+      if (audio.on && audio.selection !== state.selection) startAudio();
       const live = current.fps > 0.3;
       setStatus(live ? 'ao vivo' : 'conectando…', live);
       const viewers = data.viewers ? ' · ' + data.viewers + ' espectador(es)' : '';
+      const listeners = data.listeners ? ' · ' + data.listeners + ' ouvindo' : '';
+      const sound = current.audio ? ' · som' : ' · sem som';
       meta.textContent = current.name + ' · ' + current.channel + ' · ' + current.width + '×' + current.height +
-        ' · ' + current.fps.toFixed(1) + ' fps' + viewers;
+        ' · ' + current.fps.toFixed(1) + ' fps' + sound + viewers + listeners;
       download.href = '/snapshot.jpg?session=' + state.selection + '&t=' + Date.now();
     } catch (error) {
+      // Never swallow this silently: a malformed payload (invalid JSON) looks
+      // exactly like an offline server on screen, and an empty console makes it
+      // impossible to tell them apart.
+      console.error('VibeZ: falha ao atualizar as transmissões', error);
       setStatus('servidor fora do ar', false);
     }
   }
@@ -317,6 +526,7 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
   picker.addEventListener('change', () => {
     state.selection = Number(picker.value) || 0;
     startStream(state.selection);
+    if (audio.on) startAudio();
     refreshStreams();
   });
 
@@ -339,6 +549,7 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
     state.requested = -1;
     refreshStreams();
     startStream(state.selection);
+    if (audio.on) startAudio();
   });
 
   document.addEventListener('visibilitychange', () => {
@@ -347,6 +558,7 @@ inline constexpr std::string_view kWebPageHtml = R"HTML(<!doctype html>
     state.requested = -1;
     refreshStreams();
     startStream(state.selection);
+    if (audio.on) startAudio();
   });
 
   // A decoded frame is enough to hide the waiting overlay, both for MJPEG and

@@ -372,7 +372,7 @@ struct NetworkClient::Impl {
     }
 
     void HandleMedia(const SOCKET udp) {
-        std::array<std::uint8_t, protocol::kMaxMediaPayload + 32> buffer{};
+        std::array<std::uint8_t, protocol::kMaxMediaDatagram> buffer{};
         for (std::size_t processed = 0; processed < kMaxDatagramsPerDrain; ++processed) {
             fd_set readable;
             FD_ZERO(&readable);
@@ -384,7 +384,13 @@ struct NetworkClient::Impl {
             int senderSize = sizeof(sender);
             const int received = recvfrom(udp, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0,
                                           reinterpret_cast<sockaddr*>(&sender), &senderSize);
-            if (received <= 0) return;
+            if (received == SOCKET_ERROR) {
+                // Oversized datagrams are dropped by Winsock; skip this one but
+                // keep draining the socket so the next packets are not lost.
+                if (WSAGetLastError() == WSAEMSGSIZE) continue;
+                return;
+            }
+            if (received == 0) return;
             const auto header = protocol::DecodeMediaHeader(
                 std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(received)));
             if (!header) continue;

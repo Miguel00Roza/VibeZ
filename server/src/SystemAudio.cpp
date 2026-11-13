@@ -80,14 +80,21 @@ void SystemAudioHub::Decode(SessionAudio& session, const std::uint8_t* data, con
     std::int16_t pcm[kMaxPacketSamples]{};
     const int decoded = opus_decode(session.decoder.get(), data, static_cast<opus_int32>(size), pcm,
                                     static_cast<int>(kMaxPacketSamples), 0);
-    if (decoded > 0) Append(session, pcm, static_cast<std::size_t>(decoded));
+    if (decoded > 0) {
+        session.lastFrameSamples = static_cast<std::size_t>(decoded);
+        Append(session, pcm, static_cast<std::size_t>(decoded));
+    }
 }
 
 void SystemAudioHub::Conceal(SessionAudio& session, const std::uint32_t frames) {
     std::int16_t pcm[kMaxPacketSamples]{};
+    // libopus fills the whole requested frame_size when concealing (there is no
+    // packet telling it the real duration), so ask for exactly the last decoded
+    // frame size instead of the maximum buffer size.
+    const auto frameSamples = (std::max<std::size_t>)(session.lastFrameSamples, 120);
     for (std::uint32_t index = 0; index < frames; ++index) {
         const int decoded = opus_decode(session.decoder.get(), nullptr, 0, pcm,
-                                        static_cast<int>(kMaxPacketSamples), 0);
+                                        static_cast<int>(frameSamples), 0);
         if (decoded <= 0) break;
         Append(session, pcm, static_cast<std::size_t>(decoded));
     }
@@ -112,7 +119,8 @@ std::uint32_t SystemAudioHub::NewestSession() const {
 
 std::uint32_t SystemAudioHub::Resolve(const std::uint32_t sessionId) const {
     std::lock_guard lock(mutex_);
-    return sessionId == 0 ? NewestLocked() : sessionId;
+    if (sessionId == 0) return NewestLocked();
+    return streams_.find(sessionId) != streams_.end() ? sessionId : 0;
 }
 
 bool SystemAudioHub::Read(const std::uint32_t sessionId, std::uint64_t& cursor, std::vector<std::int16_t>& out,

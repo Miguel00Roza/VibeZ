@@ -1,17 +1,21 @@
 #include "common/protocol/Protocol.hpp"
 #include "server/include/vibez/server/Server.hpp"
 #include "server/src/ScreenStream.hpp"
+#include "server/src/SystemAudio.hpp"
 #include "server/src/WebServer.hpp"
 #include "tests/TestSupport.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <opus.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,6 +29,7 @@ using vibez::protocol::ControlType;
 using vibez::protocol::MediaType;
 using vibez::server::ScreenStreamHub;
 using vibez::server::SessionInfo;
+using vibez::server::SystemAudioHub;
 using vibez::server::WebServer;
 using vibez::server::WebServerConfig;
 
@@ -69,6 +74,57 @@ std::vector<std::vector<std::uint8_t>> Split(const std::vector<std::uint8_t>& da
                            data.begin() + static_cast<std::ptrdiff_t>(end));
     }
     return parts;
+}
+
+// Encodes a short 440 Hz tone as 20 ms Opus frames, mirroring the client's
+// system-audio stream.
+std::vector<std::vector<std::uint8_t>> EncodeOpusFrames(const int count) {
+    std::vector<std::vector<std::uint8_t>> frames;
+    int error{};
+    OpusEncoder* encoder = opus_encoder_create(48000, 1, OPUS_APPLICATION_AUDIO, &error);
+    if (!encoder || error != OPUS_OK) {
+        if (encoder) opus_encoder_destroy(encoder);
+        return frames;
+    }
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(64000));
+
+    constexpr int kSamples = 960;
+    std::uint64_t sampleIndex = 0;
+    std::array<std::uint8_t, 4000> encoded{};
+    for (int frame = 0; frame < count; ++frame) {
+        std::array<opus_int16, kSamples> pcm{};
+        for (int index = 0; index < kSamples; ++index) {
+            const double time = static_cast<double>(sampleIndex + index) / 48000.0;
+            pcm[index] = static_cast<opus_int16>(std::sin(2.0 * 3.141592653589793 * 440.0 * time) * 10000.0);
+        }
+        sampleIndex += kSamples;
+        const int bytes = opus_encode(encoder, pcm.data(), kSamples, encoded.data(), static_cast<opus_int32>(encoded.size()));
+        if (bytes <= 0) break;
+        frames.emplace_back(encoded.begin(), encoded.begin() + bytes);
+    }
+    opus_encoder_destroy(encoder);
+    return frames;
+}
+
+void PushAudioFrame(vibez::server::SystemAudioHub& hub, const std::uint32_t session, const std::uint32_t sequence,
+                    const std::vector<std::uint8_t>& payload, const bool systemAudio = true) {
+    vibez::protocol::MediaHeader header;
+    header.type = MediaType::Audio;
+    header.sessionId = session;
+    header.sequence = sequence;
+    header.timestamp = static_cast<std::uint64_t>(sequence) * 960;
+    header.payloadSize = static_cast<std::uint16_t>(payload.size());
+    header.flags = systemAudio ? vibez::protocol::kMediaFlagSystemAudio : 0;
+    header.fragmentCount = 1;
+    header.fragmentIndex = 0;
+    header.frameId = 0;
+    hub.PushPacket(header, payload);
+}
+
+bool HasAudibleSample(const std::vector<std::int16_t>& samples) {
+    return std::any_of(samples.begin(), samples.end(), [](const std::int16_t value) {
+        return value > 200 || value < -200;
+    });
 }
 
 void PushFrame(ScreenStreamHub& hub, const std::uint32_t session, const std::uint32_t frameId, const bool keyframe,
@@ -173,6 +229,27 @@ std::string RawRequest(const std::uint16_t port, const std::string& request) {
     return response;
 }
 
+// Reads just the head and a prefix of a streaming response instead of waiting
+// for the server to close the (potentially endless) connection.
+std::string HttpPrefix(const std::uint16_t port, const std::string& target, const std::size_t bytes,
+                       const std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+    const SOCKET socket = ConnectTo(port);
+    if (socket == INVALID_SOCKET) return {};
+    const std::string request = "GET " + target + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    std::string response;
+    if (SendBytes(socket, request.data(), request.size())) {
+        std::array<char, 4096> buffer{};
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (response.size() < bytes && std::chrono::steady_clock::now() < deadline) {
+            const int received = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+            if (received <= 0) break;
+            response.append(buffer.data(), static_cast<std::size_t>(received));
+        }
+    }
+    closesocket(socket);
+    return response;
+}
+
 void TestReassembly() {
     ScreenStreamHub hub;
     hub.SyncSessions({{1, "Alice", 2, "Amigos", true, 640, 480}});
@@ -258,6 +335,59 @@ void TestReassembly() {
     CHECK(hub.Streams().empty());
 }
 
+void TestAudioHub() {
+    const auto frames = EncodeOpusFrames(12);
+    CHECK_MSG(frames.size() == 12, "Opus encoder is not available");
+    if (frames.empty()) return;
+
+    SystemAudioHub hub;
+    hub.SyncSessions({{1, "Alice", 2, "Amigos", true, 640, 480}});
+    CHECK(hub.Resolve(0) == 1);
+    CHECK(hub.Resolve(1) == 1);
+    CHECK(!hub.HasRecentAudio(1));
+
+    for (std::size_t index = 0; index < 5; ++index) {
+        PushAudioFrame(hub, 1, static_cast<std::uint32_t>(index), frames[index]);
+    }
+    CHECK(hub.HasRecentAudio(1));
+    CHECK(hub.HasRecentAudio(0));
+
+    std::uint64_t cursor = 0;
+    std::vector<std::int16_t> samples;
+    CHECK_MSG(hub.Read(1, cursor, samples, 48000, std::chrono::milliseconds(200)), "No decoded audio");
+    CHECK_MSG(samples.size() >= 960, "Expected at least one 20 ms frame");
+    CHECK_MSG(HasAudibleSample(samples), "Decoded audio is silent");
+
+    // A sequence gap is concealed instead of truncating the stream: one real
+    // frame plus two PLC frames.
+    const auto before = cursor;
+    PushAudioFrame(hub, 1, 7, frames[5]);
+    samples.clear();
+    CHECK(hub.Read(1, cursor, samples, 48000, std::chrono::milliseconds(200)));
+    CHECK_MSG(samples.size() == 960 * 3, "Gap was not concealed: got " + std::to_string(samples.size()));
+    CHECK(cursor > before);
+
+    // Normal voice audio is not part of the shared-computer stream.
+    SystemAudioHub voice;
+    voice.SyncSessions({{2, "Bob", 2, "Amigos", true, 640, 480}});
+    PushAudioFrame(voice, 2, 0, frames[0], false);
+    CHECK(!voice.HasRecentAudio(2));
+
+    // A participant that stops sharing loses the decoder and the buffer.
+    hub.SyncSessions({{1, "Alice", 2, "Amigos", false, 0, 0}});
+    CHECK(!hub.HasRecentAudio(1));
+    CHECK(!hub.Read(1, cursor, samples, 4800, std::chrono::milliseconds(50)));
+
+    // Auto-follow switches to the newest sharer.
+    hub.SyncSessions({{1, "Alice", 2, "Amigos", true, 640, 480},
+                      {2, "Bob", 3, "Jogos", true, 800, 600}});
+    CHECK(hub.Resolve(0) == 2);
+    hub.SyncSessions({});
+    CHECK(hub.Resolve(0) == 0);
+    CHECK(!hub.HasRecentAudio(0));
+    hub.Clear();
+}
+
 void TestWaitingAndAutofollow() {
     ScreenStreamHub hub;
     hub.SyncSessions({{1, "Alice", 2, "Amigos", true, 640, 480}});
@@ -291,7 +421,15 @@ void TestHttpServer() {
     const auto jpeg = FakeJpeg(3000, 5);
     PushFrame(*hub, 1, 1, true, jpeg, 600);
 
-    WebServer web(hub);
+    auto audio = std::make_shared<SystemAudioHub>();
+    audio->SyncSessions({{1, "Alice", 2, "Amigos", true, 640, 480}});
+    const auto audioFrames = EncodeOpusFrames(6);
+    CHECK_MSG(audioFrames.size() == 6, "Opus encoder is not available");
+    for (std::size_t index = 0; index < audioFrames.size(); ++index) {
+        PushAudioFrame(*audio, 1, static_cast<std::uint32_t>(index), audioFrames[index]);
+    }
+
+    WebServer web(hub, audio);
     std::string error;
     WebServerConfig config;
     config.port = 0;
@@ -307,6 +445,8 @@ void TestHttpServer() {
     CHECK(page.find("text/html") != std::string::npos);
     CHECK(page.find("VibeZ") != std::string::npos);
     CHECK(page.find("stream.mjpeg") != std::string::npos);
+    CHECK(page.find("Ativar som") != std::string::npos);
+    CHECK(page.find("/audio.pcm") != std::string::npos);
 
     const auto head = RawRequest(port, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(StatusCode(head) == 200);
@@ -317,6 +457,14 @@ void TestHttpServer() {
     CHECK(api.find("\"name\":\"Alice\"") != std::string::npos);
     CHECK(api.find("\"channel\":\"Amigos\"") != std::string::npos);
     CHECK(api.find("\"fps\":") != std::string::npos);
+    CHECK(api.find("\"audio\":true") != std::string::npos);
+    CHECK(api.find("\"listeners\":") != std::string::npos);
+    // The page calls JSON.parse on this body: a single missing quote (for
+    // example ",width": instead of ",\"width\":") makes every browser show
+    // "servidor fora do ar" as soon as somebody shares.
+    CHECK(api.find("{\"id\":1,\"name\":\"Alice\",\"channelId\":2,\"channel\":\"Amigos\",\"width\":640,\"height\":480,\"fps\":") !=
+          std::string::npos);
+    CHECK(api.find(",width") == std::string::npos);
 
     for (const std::string target : {std::string("/snapshot.jpg"), std::string("/snapshot.jpg?session=1")}) {
         const auto snapshot = HttpGet(port, target);
@@ -328,6 +476,21 @@ void TestHttpServer() {
     }
 
     CHECK(StatusCode(HttpGet(port, "/snapshot.jpg?session=42")) == 503);
+
+    const auto audioHead = RawRequest(port, "HEAD /audio.pcm?session=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(StatusCode(audioHead) == 200);
+    CHECK(audioHead.find("audio/L16") != std::string::npos);
+    CHECK(BodyOf(audioHead).empty());
+
+    const auto audioPrefix = HttpPrefix(port, "/audio.pcm?session=1", 8192);
+    CHECK_MSG(StatusCode(audioPrefix) == 200, "Audio stream did not start");
+    CHECK(audioPrefix.find("Content-Type: audio/L16;rate=48000;channels=1") != std::string::npos);
+    CHECK_MSG(BodyOf(audioPrefix).size() >= 960 * 2 * 2, "Not enough decoded PCM was streamed");
+    CHECK(StatusCode(HttpGet(port, "/audio.pcm?session=42")) == 503);
+
+    // Auto-follow resolves to the newest sharer for both media types.
+    CHECK(StatusCode(HttpPrefix(port, "/audio.pcm?session=0", 512)) == 200);
+
     CHECK(StatusCode(HttpGet(port, "/missing")) == 404);
     CHECK(StatusCode(RawRequest(port, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")) == 405);
     CHECK(StatusCode(RawRequest(port, "garbage\r\n\r\n")) == 400);
@@ -363,7 +526,8 @@ void TestHttpServer() {
 
 void TestViewerLimit() {
     auto hub = std::make_shared<ScreenStreamHub>();
-    WebServer web(hub);
+    auto audio = std::make_shared<SystemAudioHub>();
+    WebServer web(hub, audio);
     std::string error;
     WebServerConfig config;
     config.port = 0;
@@ -391,7 +555,7 @@ void TestViewerLimit() {
 
 bool SendVideoFragments(const SOCKET udp, const std::uint16_t port, const std::uint32_t session,
                         const std::vector<std::uint8_t>& jpeg) {
-    constexpr std::size_t kChunk = 1000;
+    constexpr std::size_t kChunk = vibez::protocol::kMaxMediaPayload;
     const auto count = (jpeg.size() + kChunk - 1) / kChunk;
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -416,6 +580,36 @@ bool SendVideoFragments(const SOCKET udp, const std::uint16_t port, const std::u
         std::vector<std::uint8_t> packet = headerBytes;
         packet.insert(packet.end(), jpeg.begin() + static_cast<std::ptrdiff_t>(offset),
                       jpeg.begin() + static_cast<std::ptrdiff_t>(offset + bytes));
+        if (sendto(udp, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0,
+                   reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != static_cast<int>(packet.size())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SendAudioFragments(const SOCKET udp, const std::uint16_t port, const std::uint32_t session,
+                        const std::vector<std::vector<std::uint8_t>>& frames) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+        vibez::protocol::MediaHeader header;
+        header.type = MediaType::Audio;
+        header.sessionId = session;
+        header.sequence = static_cast<std::uint32_t>(index);
+        header.timestamp = static_cast<std::uint64_t>(index) * 960;
+        header.payloadSize = static_cast<std::uint16_t>(frames[index].size());
+        header.flags = vibez::protocol::kMediaFlagSystemAudio;
+        header.fragmentCount = 1;
+        header.fragmentIndex = 0;
+        header.frameId = 0;
+        const auto headerBytes = vibez::protocol::EncodeMediaHeader(header);
+        if (headerBytes.empty()) return false;
+        std::vector<std::uint8_t> packet = headerBytes;
+        packet.insert(packet.end(), frames[index].begin(), frames[index].end());
         if (sendto(udp, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0,
                    reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != static_cast<int>(packet.size())) {
             return false;
@@ -518,9 +712,26 @@ void TestEndToEnd() {
         CHECK(std::memcmp(body.data(), jpeg.data(), jpeg.size()) == 0);
     }
 
+    const auto audioFrames = EncodeOpusFrames(30);
+    CHECK_MSG(!audioFrames.empty(), "Opus encoder is not available");
+    CHECK(SendAudioFragments(udp, mediaPort, sessionId, audioFrames));
+
+    std::string audioPrefix;
+    for (int attempt = 0; attempt < 100 && webPort != 0; ++attempt) {
+        audioPrefix = HttpPrefix(webPort, "/audio.pcm?session=" + std::to_string(sessionId), 8192);
+        if (StatusCode(audioPrefix) == 200 && BodyOf(audioPrefix).size() >= 960 * 2 * 2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK_MSG(StatusCode(audioPrefix) == 200, "The web listener never received audio");
+    CHECK(audioPrefix.find("Content-Type: audio/L16;rate=48000;channels=1") != std::string::npos);
+    CHECK_MSG(BodyOf(audioPrefix).size() >= 960 * 2 * 2, "Not enough PCM reached the browser listener");
+
     const auto api = HttpGet(webPort, "/api/streams");
     CHECK(StatusCode(api) == 200);
     CHECK(api.find("\"name\":\"Alice\"") != std::string::npos);
+    CHECK(api.find("\"audio\":true") != std::string::npos);
+    CHECK(api.find("\"channel\":\"Lobby\",\"width\":640,\"height\":480,\"fps\":") != std::string::npos);
+    CHECK(api.find(",width") == std::string::npos);
 
     // Stopping the share must remove the stream from the page immediately.
     vibez::protocol::Writer stopped;
@@ -551,6 +762,7 @@ int main() {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
 
     TestReassembly();
+    TestAudioHub();
     TestWaitingAndAutofollow();
     TestHttpServer();
     TestViewerLimit();

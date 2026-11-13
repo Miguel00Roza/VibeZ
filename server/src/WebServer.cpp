@@ -207,7 +207,7 @@ std::string StreamsJson(const std::vector<StreamInfo>& streams, const std::size_
         json += ",\"name\":\"" + JsonEscape(stream.name) + "\"";
         json += ",\"channelId\":" + std::to_string(stream.channelId);
         json += ",\"channel\":\"" + JsonEscape(stream.channel) + "\"";
-        json += ",width\":" + std::to_string(stream.width);
+        json += ",\"width\":" + std::to_string(stream.width);
         json += ",\"height\":" + std::to_string(stream.height);
         json += ",\"fps\":" + std::string(fps);
         json += ",\"audio\":";
@@ -320,7 +320,8 @@ struct WebServer::Impl {
             return;
         }
         if (path == "/api/streams") {
-            const auto json = StreamsJson(hub->Streams(), static_cast<std::size_t>(viewers.load()));
+            const auto json = StreamsJson(hub->Streams(), static_cast<std::size_t>(viewers.load()),
+                                          static_cast<std::size_t>(listeners.load()), *audio);
             SendText(socket, Response(200, "application/json; charset=utf-8", json.size()));
             if (!request.head) SendText(socket, json);
             return;
@@ -339,6 +340,10 @@ struct WebServer::Impl {
         }
         if (path == "/stream.mjpeg") {
             SendStream(socket, session, request.head);
+            return;
+        }
+        if (path == "/audio.pcm") {
+            SendAudio(socket, session, request.head);
             return;
         }
         if (path == "/favicon.ico") {
@@ -395,17 +400,68 @@ struct WebServer::Impl {
             if (!SendText(socket, "\r\n--" + std::string(kBoundary) + "\r\n")) break;
         }
     }
+
+    // Streams the shared-computer sound as raw PCM16. Audio connections do not
+    // touch video frames, so a browser can listen even while the screen is
+    // paused.
+    void SendAudio(const SOCKET socket, const std::uint32_t session, const bool head) {
+        int current = listeners.load();
+        while (current < static_cast<int>(maxViewers) &&
+               !listeners.compare_exchange_weak(current, current + 1)) {
+        }
+        if (current >= static_cast<int>(maxViewers)) {
+            const std::string body = "Too many listeners. Try again in a moment.";
+            SendText(socket, Response(503, "text/plain; charset=utf-8", body.size()));
+            if (!head) SendText(socket, body);
+            return;
+        }
+        if (audio->Resolve(session) == 0) {
+            listeners.fetch_sub(1);
+            const std::string body = "No shared audio is available right now.";
+            SendText(socket, Response(503, "text/plain; charset=utf-8", body.size()));
+            if (!head) SendText(socket, body);
+            return;
+        }
+
+        SendText(socket, PcmHeaders());
+        if (head) {
+            listeners.fetch_sub(1);
+            return;
+        }
+        struct ListenerGuard {
+            std::atomic<int>& listeners;
+            ~ListenerGuard() { listeners.fetch_sub(1); }
+        } guard{listeners};
+
+        std::uint64_t cursor = SystemAudioHub::kLiveCursor;
+        std::vector<std::int16_t> samples;
+        while (!stopping.load()) {
+            samples.clear();
+            if (!audio->Read(session, cursor, samples, 4800, kFrameWait)) {
+                if (stopping.load()) break;
+                // The share ended or nobody is sharing yet: let the page
+                // reconnect and show its waiting state.
+                if (audio->Resolve(session) == 0) break;
+                if (PeerClosed(socket)) break;
+                continue;
+            }
+            if (samples.empty()) continue;
+            if (!SendAll(socket, samples.data(), samples.size() * sizeof(std::int16_t))) break;
+        }
+    }
 };
 
-WebServer::WebServer(std::shared_ptr<ScreenStreamHub> hub) : impl_(std::make_shared<Impl>()) {
+WebServer::WebServer(std::shared_ptr<ScreenStreamHub> hub, std::shared_ptr<SystemAudioHub> audio)
+    : impl_(std::make_shared<Impl>()) {
     impl_->hub = std::move(hub);
+    impl_->audio = std::move(audio);
 }
 
 WebServer::~WebServer() { Stop(); }
 
 bool WebServer::Start(const WebServerConfig& config, std::string& error) {
-    if (!impl_ || !impl_->hub) {
-        error = "The web server has no frame hub";
+    if (!impl_ || !impl_->hub || !impl_->audio) {
+        error = "The web server has no media hub";
         return false;
     }
     impl_->maxViewers = config.maxViewers == 0 ? kDefaultMaxViewers : config.maxViewers;
@@ -469,5 +525,6 @@ void WebServer::Stop() {
 std::uint16_t WebServer::Port() const noexcept { return impl_ ? impl_->port.load() : 0; }
 bool WebServer::Running() const noexcept { return impl_ && impl_->listener.load() != INVALID_SOCKET; }
 std::size_t WebServer::Viewers() const noexcept { return impl_ ? static_cast<std::size_t>(impl_->viewers.load()) : 0; }
+std::size_t WebServer::Listeners() const noexcept { return impl_ ? static_cast<std::size_t>(impl_->listeners.load()) : 0; }
 
 } // namespace vibez::server

@@ -76,6 +76,7 @@ private:
         std::int64_t lastPacketMs{};
         std::uint32_t lastSequence{};
         bool hasSequence{};
+        std::size_t lastFrameSamples{960};
         std::unique_ptr<OpusDecoder, OpusDecoderDeleter> decoder;
     };
 
