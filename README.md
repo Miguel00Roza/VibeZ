@@ -2,6 +2,15 @@
 
 VibeZ é uma aplicação nativa para comunicação em tempo real. A fundação atual entrega um servidor headless com canais, presença e relay UDP validado, um cliente com interface gráfica Qt 6 e um cliente de console, ambos transmitindo voz ponta a ponta usando WASAPI e Opus, com compartilhamento de tela e do som do computador. Autenticação ainda está em desenvolvimento.
 
+## Baixar os instaladores
+
+| Produto | Arquivo | Tamanho |
+|---|---|---|
+| Cliente (voz + tela) | [VibeZ-Setup-0.1.0.exe](dist/VibeZ-Setup-0.1.0.exe) | 10,7 MB |
+| Servidor | [VibeZServer-Setup-0.1.0.exe](dist/VibeZServer-Setup-0.1.0.exe) | 2,7 MB |
+
+Windows 10/11 x64. A instalação é por usuário e não pede administrador. Os instaladores não são assinados digitalmente: se o SmartScreen aparecer, use **Mais informações → Executar assim mesmo**.
+
 ## Estado atual
 
 - `VibeZServer.exe`: servidor TCP/UDP, com canal `Lobby`, criação/remoção de canais, entrada/saída, mute e estado de compartilhamento.
@@ -53,6 +62,8 @@ Cada execução compila o alvo em Release, monta um *staging* limpo (`out/deploy
 | Servidor | `VibeZServer-Setup-<versão>.exe` | `VibeZServer.exe`, `opus.dll`, runtime C++ app-local, `vibez-server.ini` |
 
 Os dois são **por usuário, sem UAC**: instalam em `%LOCALAPPDATA%\Programs\VibeZ` e `%LOCALAPPDATA%\Programs\VibeZ Server`, criam atalhos no Menu Iniciar (e opcionalmente na área de trabalho), usam ícone próprio e oferecem português do Brasil e inglês. A versão sai de `-AppVersion` (padrão `0.1.0`); `-TestInstall` faz instalação silenciosa em pasta temporária, checagem dos arquivos, inicialização real do executável e desinstalação.
+
+Além de `out/installer/`, cada build copia o resultado para `dist/` — a pasta versionada de onde saem os links de download acima — e apaga a versão anterior do mesmo produto. Use `-NoDist` para gerar só em `out/installer/`. Ao publicar uma versão nova, atualize a tabela de download no topo do README.
 
 O instalador do servidor tem uma página extra para escolher **a porta do app** (voz, vídeo e controle — TCP e UDP) e **a porta do site** (visualizador no navegador). Os valores vão para `vibez-server.ini` na pasta de instalação e podem ser passados também em instalações silenciosas:
 

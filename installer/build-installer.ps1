@@ -6,7 +6,9 @@
 #
 # Each product is staged from the Release build into a clean directory (the
 # shared build directory also holds Debug DLLs, which must never reach users),
-# audited, and then compiled with Inno Setup 6.
+# audited, and then compiled with Inno Setup 6. The result is also copied into
+# dist/, which is committed so the README download links keep working; use
+# -NoDist to skip that step.
 [CmdletBinding()]
 param(
     [ValidateSet('Client', 'Server', 'All')]
@@ -16,6 +18,8 @@ param(
     [string]$Iscc,
     [switch]$SkipBuild,
     [switch]$SkipDependencyCheck,
+    # Keeps the installer only in out/installer, without publishing to dist/.
+    [switch]$NoDist,
     # Installs each result silently into a temporary directory, checks it, then
     # uninstalls again. Leaves the machine clean.
     [switch]$TestInstall
@@ -84,6 +88,26 @@ function Invoke-InnoSetup {
     Write-Host "Instalador: $($item.FullName)" -ForegroundColor Green
     Write-Host ("Tamanho:    {0:N1} MB" -f ($item.Length / 1MB)) -ForegroundColor Green
     return $installer
+}
+
+# Copies the finished installer into dist/, the folder committed to the
+# repository that the README links point at. Older versions of the same product
+# are removed so a clone only carries the current release.
+function Publish-Distribution {
+    param([string]$Installer, [string]$ProductName)
+    $distDir = Join-Path $repoRoot 'dist'
+    New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+
+    $name = Split-Path $Installer -Leaf
+    Get-ChildItem $distDir -Filter "$ProductName-Setup-*.exe" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $name } |
+        ForEach-Object {
+            Write-Host "  removendo versao anterior: $($_.Name)" -ForegroundColor Yellow
+            Remove-Item $_.FullName -Force
+        }
+
+    Copy-Item -Path $Installer -Destination $distDir -Force
+    Write-Host "  dist\$name" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
@@ -397,11 +421,25 @@ if ($TestInstall) {
     if ($installers.Contains('Server')) { Test-ServerInstaller -Installer $installers.Server }
 }
 
+$distFiles = @()
+if (-not $NoDist) {
+    Write-Section 'Publicando em dist (usado pelos links do README)'
+    foreach ($name in $installers.Keys) {
+        $productName = if ($name -eq 'Client') { 'VibeZ' } else { 'VibeZServer' }
+        Publish-Distribution -Installer $installers[$name] -ProductName $productName
+        $distFiles += Join-Path (Join-Path $repoRoot 'dist') (Split-Path $installers[$name] -Leaf)
+    }
+}
+
 Write-Host ''
 Write-Host 'Concluido:' -ForegroundColor Cyan
 foreach ($name in $installers.Keys) {
     $file = Get-Item $installers[$name]
     Write-Host ("  {0,-7} {1} ({2:N1} MB)" -f $name, $file.FullName, ($file.Length / 1MB))
+}
+foreach ($file in $distFiles) {
+    $item = Get-Item $file
+    Write-Host ("  dist    {0} ({1:N1} MB)" -f $item.Name, ($item.Length / 1MB))
 }
 
 } finally {
